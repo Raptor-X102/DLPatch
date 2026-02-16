@@ -201,6 +201,7 @@ static bool remote_munmap(pid_t pid, uintptr_t addr, size_t length, uintptr_t sy
 // ============================================================================
 // Helper to check if library is still mapped
 // ============================================================================
+/*
 static bool is_library_mapped(pid_t pid, const std::string& lib_path) {
     std::string maps_path = "/proc/" + std::to_string(pid) + "/maps";
     std::ifstream maps_file(maps_path);
@@ -223,7 +224,7 @@ static bool force_unload_library(pid_t pid, uintptr_t base_addr, size_t total_si
     // First try to unmap the entire region
     return remote_munmap(pid, base_addr, total_size, syscall_insn_addr);
 }
-
+*/
 // ============================================================================
 // Initialization of required addresses from libc
 // ============================================================================
@@ -644,10 +645,14 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
 // ============================================================================
 // Apply jmp patch from old function to new function
 // ============================================================================
-bool DL_Manager::apply_patch(pid_t tid, uintptr_t old_func, uintptr_t new_func,
-                              struct user_regs_struct& saved_regs) {
+// В функции apply_patch удаляем неиспользуемые параметры или используем их
+
+bool DL_Manager::apply_patch(pid_t /*tid*/, uintptr_t old_func, uintptr_t new_func,
+                              struct user_regs_struct& /*saved_regs*/) {
+    // tid и saved_regs не используются, но могут понадобиться в будущем
+    // Пока просто закомментируем имена
+    
     // Calculate relative jump offset
-    // jmp rel32: E9 + 4-byte offset = 5 bytes
     int32_t rel32 = static_cast<int32_t>(new_func - (old_func + 5));
     unsigned char patch[5] = {0xE9, 0, 0, 0, 0};
     memcpy(patch + 1, &rel32, 4);
@@ -779,7 +784,67 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
 }
 
 // ============================================================================
-// Main replace_library method
+// Apply patches for one function or all functions
+// ============================================================================
+bool DL_Manager::apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_base,
+                                     const std::string& target_function,
+                                     struct user_regs_struct& saved_regs) {
+    bool all_success = true;
+
+    if (target_function == "all") {
+        // Get all functions from old library
+        auto old_functions = get_function_symbols(old_base);
+        std::cout << "Found " << old_functions.size() << " functions in old library" << std::endl;
+
+        for (const auto& func_pair : old_functions) {
+            const std::string& func_name = func_pair.first;
+            uintptr_t old_func_addr = func_pair.second;
+
+            // Find corresponding function in new library
+            uintptr_t new_func_addr = get_symbol_address(new_base, func_name);
+            if (new_func_addr == 0) {
+                std::cout << "Warning: function '" << func_name << "' not found in new library, skipping" << std::endl;
+                continue;
+            }
+
+            if (old_func_addr != new_func_addr) {
+                std::cout << "Patching " << func_name << ": 0x" << std::hex << old_func_addr
+                          << " -> 0x" << new_func_addr << std::dec << std::endl;
+                if (!apply_patch(tid, old_func_addr, new_func_addr, saved_regs)) {
+                    std::cerr << "Failed to patch " << func_name << std::endl;
+                    all_success = false;
+                    // Continue trying to patch others
+                }
+            } else {
+                std::cout << "Function " << func_name << " already at same address, skipping" << std::endl;
+            }
+        }
+    } else {
+        // Single function patching
+        uintptr_t old_func = get_symbol_address(old_base, target_function);
+        uintptr_t new_func = get_symbol_address(new_base, target_function);
+
+        if (old_func == 0 || new_func == 0) {
+            std::cerr << "Failed to find target function '" << target_function << "' in libraries" << std::endl;
+            return false;
+        }
+
+        std::cout << "Target function at 0x" << std::hex << old_func << std::dec << std::endl;
+        std::cout << "New function at 0x" << std::hex << new_func << std::dec << std::endl;
+
+        if (old_func != new_func) {
+            all_success = apply_patch(tid, old_func, new_func, saved_regs);
+        } else {
+            std::cout << "Function addresses are identical, no patch needed." << std::endl;
+            all_success = true;
+        }
+    }
+
+    return all_success;
+}
+
+// ============================================================================
+// Main replace_library method - complete version
 // ============================================================================
 bool DL_Manager::replace_library(const std::string& target_lib_pattern,
                                   const std::string& new_lib_path,
@@ -789,7 +854,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     std::cout << "New: " << new_lib_path << std::endl;
     std::cout << "Function: " << target_function << std::endl;
     
-    // 1. Safety check
+    // 1. Safety check - no thread should be executing code from the target library
     if (!is_safe_to_replace(target_lib_pattern)) {
         std::cerr << "Not safe to replace library: threads are using it" << std::endl;
         return false;
@@ -820,7 +885,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     std::vector<pid_t> tids = stop_threads_and_prepare_main(main_tid, saved_regs);
     if (tids.empty()) return false;
     
-    // 6. Test syscall mechanism
+    // 6. Test syscall mechanism to ensure remote operations work
     if (!test_syscall(main_tid)) {
         resume_all_threads(tids);
         return false;
@@ -832,7 +897,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     bool already_loaded = is_library_already_loaded(new_lib_path, new_lib_base, new_handle);
     
     if (!already_loaded) {
-        // Load the new library
+        // Load the new library via remote dlopen
         new_lib_base = load_new_library(main_tid, new_lib_path, new_handle, saved_regs);
         if (new_lib_base == 0) {
             resume_all_threads(tids);
@@ -842,55 +907,42 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         // Add to tracker
         TrackedLibrary new_lib(new_lib_path, new_handle, new_lib_base, target_function);
         tracked_libraries_[new_lib_path] = new_lib;
+        std::cout << "New library added to tracker" << std::endl;
     } else {
         std::cout << "Library already loaded, using existing copy." << std::endl;
     }
     
-    // 8. Get function addresses
-    uintptr_t old_func = get_symbol_address(target_info.base_addr, target_function);
-    uintptr_t new_func = get_symbol_address(new_lib_base, target_function);
-    
-    if (old_func == 0 || new_func == 0) {
-        std::cerr << "Failed to find target function in libraries" << std::endl;
-        resume_all_threads(tids);
-        return false;
-    }
-    
-    std::cout << "Old function at 0x" << std::hex << old_func << std::dec << std::endl;
-    std::cout << "New function at 0x" << std::hex << new_func << std::dec << std::endl;
-    
-    // 9. Apply patch if addresses differ
-    bool patch_success = true;
-    if (old_func == new_func) {
-        std::cout << "Function addresses are identical, no patch needed." << std::endl;
-    } else {
-        patch_success = apply_patch(main_tid, old_func, new_func, saved_regs);
-    }
+    // 8. Apply patches (single function or all functions)
+    bool patch_success = apply_all_patches(main_tid, target_info.base_addr, new_lib_base,
+                                           target_function, saved_regs);
     
     if (patch_success) {
-        // 10. Deactivate all libraries except the new one
+        // 9. Deactivate all libraries except the new one
         for (auto& pair : tracked_libraries_) {
             if (pair.first != new_lib_path) {
                 pair.second.is_active = false;
+                std::cout << "Deactivated: " << pair.first << std::endl;
             }
         }
         
         // Mark the new library as active
         tracked_libraries_[new_lib_path].is_active = true;
         tracked_libraries_[new_lib_path].patched_libraries.push_back(target_info.path);
+        std::cout << "Activated: " << new_lib_path << std::endl;
         
         // Mark the target as original if not already
         if (tracked_libraries_.find(target_info.path) == tracked_libraries_.end()) {
             TrackedLibrary target_lib(target_info.path, 0, target_info.base_addr, target_function);
             target_lib.is_original = true;
             tracked_libraries_[target_info.path] = target_lib;
+            std::cout << "Added original library to tracker: " << target_info.path << std::endl;
         }
         
-        // 11. Clean up old unused libraries
+        // 10. Clean up old unused libraries
         cleanup_old_libraries(target_info.path, new_lib_path, main_tid, saved_regs);
     }
     
-    // 12. Resume all threads
+    // 11. Resume all threads
     resume_all_threads(tids);
     
     std::cout << "=== Library replacement completed " 

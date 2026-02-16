@@ -42,8 +42,8 @@ public:
     
     // New method for multi-library management
     bool replace_library(const std::string& target_lib_pattern, 
-                         const std::string& new_lib_path,
-                         const std::string& target_function = "perform_op");
+                     const std::string& new_lib_path,
+                     const std::string& target_function = "all");
     
     // Utility methods
     void print_library_tracker() const;
@@ -83,6 +83,12 @@ private:
                                const std::string& new_lib_path,
                                pid_t tid,
                                struct user_regs_struct& saved_regs);
+
+    std::vector<std::pair<std::string, uintptr_t>> get_function_symbols(uintptr_t lib_base) const;
+    
+    bool apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_base,
+                           const std::string& target_function,
+                           struct user_regs_struct& saved_regs);
 };
 
 #include "DL_Manager_get_lib_data.ipp"
