@@ -28,6 +28,8 @@ public:
     bool replace_library(const std::string& target_lib_pattern, const std::string& new_lib_path);
 private:
     pid_t pid_;
+    uintptr_t current_active_handle_;
+    std::string current_active_path_;   
 };
 
 // Include implementation files
