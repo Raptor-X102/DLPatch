@@ -1,3 +1,4 @@
+// DL_Manager_get_lib_data.ipp
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -10,15 +11,13 @@ std::vector<std::string> DL_Manager::get_loaded_libraries() const {
     std::ifstream file(maps_path);
 
     if (!file.is_open()) {
-        std::cerr << "Error: cannot open " << maps_path << std::endl;
+        LOG_ERR("Cannot open %s", maps_path.c_str());
         return libs;
     }
 
     std::string line;
     while (std::getline(file, line)) {
-        if (line.find(".so") == std::string::npos) {
-            continue;
-        }
+        if (line.find(".so") == std::string::npos) continue;
 
         std::istringstream iss(line);
         std::string address, perms, offset, dev, inode;
@@ -27,13 +26,8 @@ std::vector<std::string> DL_Manager::get_loaded_libraries() const {
         iss >> address >> perms >> offset >> dev >> inode;
         std::getline(iss, pathname);
 
-        if (!pathname.empty() && pathname[0] == ' ') {
-            pathname = pathname.substr(1);
-        }
-
-        if (!pathname.empty()) {
-            libs.push_back(pathname);
-        }
+        if (!pathname.empty() && pathname[0] == ' ') pathname = pathname.substr(1);
+        if (!pathname.empty()) libs.push_back(pathname);
     }
 
     std::sort(libs.begin(), libs.end());
@@ -43,12 +37,12 @@ std::vector<std::string> DL_Manager::get_loaded_libraries() const {
 
 void DL_Manager::print_loaded_libraries() const {
     auto libs = get_loaded_libraries();
-    std::cout << "Loaded libraries in PID " << pid_ << ":\n";
+    LOG_INFO("Loaded libraries in PID %d:", pid_);
     if (libs.empty()) {
-        std::cout << "  No libraries found.\n";
+        LOG_INFO("  No libraries found.");
     } else {
         for (const auto& lib : libs) {
-            std::cout << "  " << lib << std::endl;
+            LOG_INFO("  %s", lib.c_str());
         }
     }
 }
@@ -61,7 +55,7 @@ LibraryInfo DL_Manager::get_library_info(const std::string& lib_name) const {
     std::ifstream file(maps_path);
 
     if (!file.is_open()) {
-        std::cerr << "Error: cannot open " << maps_path << std::endl;
+        LOG_ERR("Cannot open %s", maps_path.c_str());
         return info;
     }
 
@@ -70,21 +64,15 @@ LibraryInfo DL_Manager::get_library_info(const std::string& lib_name) const {
     uintptr_t max_addr = 0;
 
     while (std::getline(file, line)) {
-        if (line.find(lib_name) == std::string::npos) {
-            continue;
-        }
+        if (line.find(lib_name) == std::string::npos) continue;
 
         std::istringstream iss(line);
         std::string addr_range, perms, offset, dev, inode, path;
         iss >> addr_range >> perms >> offset >> dev >> inode;
         std::getline(iss, path);
 
-        if (!path.empty() && path[0] == ' ') {
-            path = path.substr(1);
-        }
-        if (info.path.empty() && !path.empty()) {
-            info.path = path;
-        }
+        if (!path.empty() && path[0] == ' ') path = path.substr(1);
+        if (info.path.empty() && !path.empty()) info.path = path;
 
         size_t dash = addr_range.find('-');
         if (dash != std::string::npos) {
@@ -101,6 +89,5 @@ LibraryInfo DL_Manager::get_library_info(const std::string& lib_name) const {
         info.base_addr = min_addr;
         info.size = max_addr - min_addr;
     }
-
     return info;
 }

@@ -1,3 +1,4 @@
+// DL_Manager.hpp
 #ifndef LIBRARY_SCANNER_HPP
 #define LIBRARY_SCANNER_HPP
 
@@ -6,6 +7,7 @@
 #include <map>
 #include <cstdint>
 #include <sys/types.h>
+#include "logging.hpp"
 
 struct LibraryInfo {
     std::string path;
@@ -16,16 +18,25 @@ struct LibraryInfo {
 
 struct TrackedLibrary {
     std::string path;
-    uintptr_t handle;        // handle from dlopen
-    uintptr_t base_addr;      // base address in memory
-    std::string target_function; // function that was patched (e.g., "perform_op")
+    uintptr_t handle;          // handle from dlopen
+    uintptr_t base_addr;        // base address in memory
+    std::vector<std::string> patched_functions; // functions patched from other libs
+    std::vector<std::string> provided_functions; // all functions this library exports
     std::vector<std::string> patched_libraries; // libraries that were patched to point to this one
-    bool is_active;           // whether this library is currently the target of any patch
-    bool is_original;         // whether this is the original library (should never be unloaded)
+    bool is_active;              // whether this library is currently the target of any patch
+    bool is_original;            // whether this is the original library (should never be unloaded)
     
     TrackedLibrary() : handle(0), base_addr(0), is_active(false), is_original(false) {}
+    
     TrackedLibrary(const std::string& p, uintptr_t h, uintptr_t addr, const std::string& func) 
-        : path(p), handle(h), base_addr(addr), target_function(func), is_active(false), is_original(false) {}
+        : path(p), handle(h), base_addr(addr), is_active(false), is_original(false) {
+        provided_functions.push_back(func);
+    }
+    
+    TrackedLibrary(const std::string& p, uintptr_t h, uintptr_t addr, 
+                   const std::vector<std::string>& functions) 
+        : path(p), handle(h), base_addr(addr), provided_functions(functions), 
+          is_active(false), is_original(false) {}
 };
 
 class DL_Manager {
@@ -40,12 +51,10 @@ public:
     void print_loaded_libraries() const;
     uintptr_t get_symbol_address(uintptr_t lib_base, const std::string& sym_name) const;
     
-    // New method for multi-library management
     bool replace_library(const std::string& target_lib_pattern, 
                      const std::string& new_lib_path,
                      const std::string& target_function = "all");
     
-    // Utility methods
     void print_library_tracker() const;
     bool unload_library(const std::string& lib_path);
 
@@ -55,30 +64,32 @@ private:
     uintptr_t dlclose_addr_;
     uintptr_t syscall_insn_;
     
-    // Track all libraries we've loaded and their relationships
     std::map<std::string, TrackedLibrary> tracked_libraries_;
     
-    // Initialize required addresses from libc
     void init_addresses();
     
-    // Helper methods
     bool is_library_already_loaded(const std::string& lib_path, uintptr_t& base_addr, uintptr_t& handle);
     uintptr_t find_syscall_instruction(uintptr_t libc_base);
     bool test_syscall(pid_t tid);
     
-    // Thread management
     std::vector<pid_t> stop_threads_and_prepare_main(pid_t& main_tid, struct user_regs_struct& saved_regs);
     
-    // Library loading/unloading
+    // New helper methods for load_new_library
+    uintptr_t allocate_remote_memory(pid_t tid, size_t size);
+    bool write_shellcode_with_verification(pid_t tid, uintptr_t shellcode_addr,
+                                           uintptr_t path_addr, uintptr_t result_addr);
+    bool execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode_addr,
+                                          struct user_regs_struct& saved_regs,
+                                          uintptr_t& out_handle);
+    uintptr_t get_loaded_library_base(const std::string& lib_path) const;
+    
     uintptr_t load_new_library(pid_t tid, const std::string& lib_path, 
                                uintptr_t& out_handle, struct user_regs_struct& saved_regs);
     bool unload_library_by_handle(pid_t tid, uintptr_t handle, struct user_regs_struct& saved_regs);
     
-    // Patching
     bool apply_patch(pid_t tid, uintptr_t old_func, uintptr_t new_func, 
                      struct user_regs_struct& saved_regs);
     
-    // Cleanup after patch
     void cleanup_old_libraries(const std::string& target_lib_path, 
                                const std::string& new_lib_path,
                                pid_t tid,
@@ -87,8 +98,18 @@ private:
     std::vector<std::pair<std::string, uintptr_t>> get_function_symbols(uintptr_t lib_base) const;
     
     bool apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_base,
-                           const std::string& target_function,
-                           struct user_regs_struct& saved_regs);
+                       const std::string& new_lib_path,
+                       const std::string& target_function,
+                       struct user_regs_struct& saved_regs);
+    
+    // Additional helpers for replace_library
+    bool check_preconditions(const std::string& target_lib_pattern);
+    bool ensure_new_library_loaded(pid_t main_tid, const std::string& new_lib_path,
+                                   uintptr_t& new_lib_base, uintptr_t& new_handle,
+                                   struct user_regs_struct& saved_regs);
+    bool apply_patches_and_update_tracker(pid_t main_tid, uintptr_t target_base, uintptr_t new_base,
+                                          const std::string& new_lib_path, const std::string& target_func,
+                                          struct user_regs_struct& saved_regs);
 };
 
 #include "DL_Manager_get_lib_data.ipp"
