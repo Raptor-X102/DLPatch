@@ -1,4 +1,5 @@
 // DL_Manager_extract_funcs_from_lib.ipp
+#include <cstdio>
 #include <elf.h>
 #include <sys/uio.h>
 #include <vector>
@@ -15,6 +16,51 @@ static bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t 
 template<typename T>
 static bool read_struct(pid_t pid, uintptr_t addr, T& value) {
     return read_process_memory(pid, addr, &value, sizeof(T));
+}
+
+// ============================================================================
+// GNU hash table parser
+// Returns the maximum symbol index + 1, or 0 on failure.
+// ============================================================================
+static uint32_t parse_gnu_hash(pid_t pid, uintptr_t gnu_hash_addr) {
+    // Header: nbucket, symoffset, bloom_size, bloom_shift
+    uint32_t header[4];
+    if (!read_process_memory(pid, gnu_hash_addr, header, sizeof(header))) {
+        LOG_DBG("Failed to read GNU hash header");
+        return 0;
+    }
+    uint32_t nbucket = header[0];
+    uint32_t symoffset = header[1];
+    uint32_t bloom_size = header[2];
+    // uint32_t bloom_shift = header[3]; // not needed
+
+    // Address of bucket array
+    uintptr_t bucket_addr = gnu_hash_addr + 16 + bloom_size * 8; // 64-bit bloom
+    // Address of chain array
+    uintptr_t chain_addr = bucket_addr + nbucket * 4;
+
+    uint32_t max_idx = symoffset - 1; // symbols before symoffset exist, but we don't have chain info for them
+    for (uint32_t i = 0; i < nbucket; ++i) {
+        uint32_t bucket_val;
+        if (!read_process_memory(pid, bucket_addr + i * 4, &bucket_val, 4)) {
+            LOG_DBG("Failed to read bucket[%u]", i);
+            continue;
+        }
+        if (bucket_val == 0) continue;
+
+        uint32_t j = bucket_val;
+        while (true) {
+            uint32_t chain_val;
+            if (!read_process_memory(pid, chain_addr + (j - symoffset) * 4, &chain_val, 4)) {
+                LOG_DBG("Failed to read chain for index %u", j);
+                break;
+            }
+            if (j > max_idx) max_idx = j;
+            if (chain_val & 1) break; // last in chain
+            ++j;
+        }
+    }
+    return max_idx + 1; // total symbols count
 }
 
 static std::string read_string(pid_t pid, uintptr_t addr, size_t max_len = 256) {
@@ -119,8 +165,11 @@ uintptr_t DL_Manager::get_symbol_address(uintptr_t lib_base, const std::string& 
     return 0;
 }
 
-std::vector<std::pair<std::string, uintptr_t>> DL_Manager::get_function_symbols(uintptr_t lib_base) const {
-    std::vector<std::pair<std::string, uintptr_t>> symbols;
+// ============================================================================
+// Get all function symbols with their sizes (НОВАЯ ВЕРСИЯ)
+// ============================================================================
+std::vector<SymbolInfo> DL_Manager::get_function_symbols(uintptr_t lib_base) const {
+    std::vector<SymbolInfo> symbols;
     
     Elf64_Ehdr ehdr;
     if (!read_struct(pid_, lib_base, ehdr)) {
@@ -176,6 +225,7 @@ std::vector<std::pair<std::string, uintptr_t>> DL_Manager::get_function_symbols(
     uintptr_t strtab = 0, symtab = 0;
     size_t strsz = 0, syment = 0;
     uintptr_t hash = 0;
+    uintptr_t gnu_hash = 0;
 
     for (const auto& d : dyn) {
         switch (d.d_tag) {
@@ -184,6 +234,7 @@ std::vector<std::pair<std::string, uintptr_t>> DL_Manager::get_function_symbols(
             case DT_STRSZ:  strsz = d.d_un.d_val; break;
             case DT_SYMENT: syment = d.d_un.d_val; break;
             case DT_HASH:   hash = d.d_un.d_ptr; break;
+            case DT_GNU_HASH: gnu_hash = d.d_un.d_ptr; break;
             default: break;
         }
     }
@@ -200,8 +251,14 @@ std::vector<std::pair<std::string, uintptr_t>> DL_Manager::get_function_symbols(
             LOG_ERR("Failed to read hash table header");
             return symbols;
         }
+    } else if (gnu_hash != 0) {
+        nchain = parse_gnu_hash(pid_, gnu_hash);
+        if (nchain == 0) {
+            LOG_WARN("Failed to parse GNU hash, will iterate with limit");
+            nchain = 10000;
+        }
     } else {
-        LOG_WARN("No DT_HASH found, will iterate until read fails");
+        LOG_WARN("No hash table found (neither DT_HASH nor DT_GNU_HASH), will iterate until read fails");
         nchain = 10000;
     }
 
@@ -219,11 +276,22 @@ std::vector<std::pair<std::string, uintptr_t>> DL_Manager::get_function_symbols(
         uintptr_t name_addr = strtab + sym.st_name;
         std::string name = read_string(pid_, name_addr, strsz);
         if (!name.empty()) {
-            symbols.emplace_back(name, lib_base + sym.st_value);
+            symbols.emplace_back(name, lib_base + sym.st_value, sym.st_size);
         }
     }
 
     std::sort(symbols.begin(), symbols.end(), 
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+              [](const auto& a, const auto& b) { return a.name < b.name; });
     return symbols;
 }
+
+// ============================================================================
+// Get size of a specific symbol
+// ============================================================================
+size_t DL_Manager::get_symbol_size(uintptr_t lib_base, const std::string& sym_name) const {
+    auto symbols = get_function_symbols(lib_base);
+    for (const auto& s : symbols) {
+        if (s.name == sym_name) return s.size;
+    }
+    return 0;
+} 

@@ -6,51 +6,85 @@
 #include <cstdlib>
 #include <ctime>
 #include <dlfcn.h>
+#include <vector>
+#include <random>
+#include <atomic>
 
+// Thread-local random number generators for worker threads
+thread_local std::mt19937 rng(std::random_device{}());
+thread_local std::uniform_real_distribution<> dist(1.0, 10.0);
+std::atomic<int> g_counter{0};
+
+void worker_function(int /*id*/) {  // id unused, kept for potential future use
+    double accumulator = 0.0;
+    int iterations = 0;
+    
+    while (true) {
+        double x = dist(rng);
+        double y = dist(rng);
+        
+        // Call math functions to keep library in use
+        double res1 = add(x, y);
+        double res2 = subtract(x, y);
+        double res3 = multiply(x, y);
+        double res4 = divide(x, y);
+        
+        // Accumulate results to prevent optimization
+        accumulator += res1 + res2 + res3 + res4;
+        iterations++;
+        g_counter++;
+        
+        // No output from worker threads – only main thread prints
+        
+        // Sleep to control call frequency (approx 2 calls per second)
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
 
 int main() {
     std::cout << "Target program running with PID: " << getpid() << std::endl;
     std::srand(std::time(nullptr));
     
+    const int NUM_WORKERS = 3;
+    std::vector<std::thread> workers;
+    for (int i = 0; i < NUM_WORKERS; ++i) {
+        workers.emplace_back(worker_function, i + 1);
+    }
+    
     int counter = 0;
     while (true) {
-        std::cout << "\n--- Iteration " << ++counter << " ---" << std::endl;
+        std::cout << "\n--- Main iteration " << ++counter << " ---" << std::endl;
+        std::cout << "Total worker calls: " << g_counter.load() << std::endl;
         
         double a = 10.0;
         double b = 5.0;
         
-        double sum = add(a, b);
-        std::cout << "add: " << sum << std::endl;
+        std::cout << "add: " << add(a, b) << std::endl;
+        std::cout << "subtract: " << subtract(a, b) << std::endl;
+        std::cout << "multiply: " << multiply(a, b) << std::endl;
+        std::cout << "divide: " << divide(a, b) << std::endl;
+        std::cout << "power (a^2): " << power(a, 2.0) << std::endl;
         
-        double diff = subtract(a, b);
-        std::cout << "subtract: " << diff << std::endl;
-        
-        double prod = multiply(a, b);
-        std::cout << "multiply: " << prod << std::endl;
-        
-        double quot = divide(a, b);
-        std::cout << "divide: " << quot << std::endl;
-        
-        double pow = power(a, 2.0);
-        std::cout << "power (a^2): " << pow << std::endl;
-        
-        // Для v3 также попробуем modulus, если символ доступен
-        // Используем dlsym для проверки наличия функции modulus
+        // Try to use modulus if available (v3 only)
         void* handle = dlopen(NULL, RTLD_LAZY);
         if (handle) {
             typedef double (*mod_func)(int, int);
             mod_func mod = (mod_func)dlsym(handle, "modulus");
             if (mod) {
-                double mod_result = mod(10, 3);
-                std::cout << "modulus: " << mod_result << std::endl;
+                std::cout << "modulus: " << mod(10, 3) << std::endl;
             }
             dlclose(handle);
         }
         
         std::cout << "perform_op: " << perform_op(a, b) << std::endl;
         
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+        // Main loop iteration every 5 seconds
+        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
 
+    // Join threads (never reached, but for completeness)
+    for (auto& t : workers) {
+        t.join();
+    }
     return 0;
 }
