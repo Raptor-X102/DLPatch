@@ -54,6 +54,18 @@ struct ThreadContext {
     struct user_regs_struct regs;
 };
 
+struct DynamicInfo {
+    uintptr_t strtab = 0;
+    uintptr_t symtab = 0;
+    uintptr_t jmprel = 0;      // DT_JMPREL
+    size_t pltrelsz = 0;        // DT_PLTRELSZ
+    uint64_t pltrel_type = 0;   // DT_PLTREL (DT_RELA или DT_REL)
+    size_t strsz = 0;
+    size_t syment = 0;
+    uintptr_t hash = 0;          // DT_HASH
+    uintptr_t gnu_hash = 0;      // DT_GNU_HASH
+};
+
 class DL_Manager {
 public:
     explicit DL_Manager(pid_t pid) : pid_(pid), dlopen_addr_(0), dlclose_addr_(0), syscall_insn_(0) {
@@ -103,7 +115,7 @@ private:
                                uintptr_t& out_handle, struct user_regs_struct& saved_regs);
     bool unload_library_by_handle(pid_t tid, uintptr_t handle, struct user_regs_struct& saved_regs);
     
-    bool apply_patch(pid_t tid, uintptr_t old_func, uintptr_t new_func,
+    bool apply_patch(pid_t tid, uintptr_t old_lib_base, uintptr_t old_func, uintptr_t new_func,
                      size_t old_func_size, const std::string& func_name,
                      struct user_regs_struct& saved_regs);
     
@@ -130,11 +142,16 @@ private:
                                            std::vector<pid_t>& stopped_tids,
                                            int max_attempts = 50,
                                            int retry_us = 10000);
+
+    uintptr_t find_got_entry(uintptr_t lib_base, const std::string& sym_name) const;
 };
 
+#include "DL_Manager_helpers.ipp"
+#include "DL_Manager_parse_elf.ipp"
 #include "DL_Manager_get_lib_data.ipp"
 #include "DL_Manager_check.ipp"
 #include "DL_Manager_extract_funcs_from_lib.ipp"
-#include "DL_manager_replace.ipp"
+#include "DL_Manager_replace.ipp"
+#include "DL_Manager_GOT.ipp"
 
 #endif // LIBRARY_SCANNER_HPPendif // LIBRARY_SCANNER_HPP

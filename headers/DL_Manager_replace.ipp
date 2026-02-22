@@ -787,9 +787,37 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
     return success;
 }
 
-bool DL_Manager::apply_patch(pid_t tid, uintptr_t old_func, uintptr_t new_func,
-                              size_t old_func_size, const std::string& func_name,
+bool DL_Manager::apply_patch(pid_t tid, uintptr_t old_lib_base, uintptr_t old_func,
+                              uintptr_t new_func, size_t old_func_size,
+                              const std::string& func_name,
                               struct user_regs_struct& /*saved_regs*/) {
+    const size_t THRESHOLD = 16; // функции меньше этого размера патентуем через GOT
+
+    if (old_func_size < THRESHOLD) {
+        LOG_INFO("Function '%s' is small (%zu bytes), trying GOT patch", func_name.c_str(), old_func_size);
+        uintptr_t got_entry = find_got_entry(old_lib_base, func_name);
+        if (got_entry == 0) {
+            LOG_WARN("No GOT entry found for '%s', cannot patch", func_name.c_str());
+            return false;
+        }
+
+        if (!write_remote_memory(tid, got_entry, &new_func, sizeof(new_func))) {
+            LOG_ERR("Failed to write GOT entry at 0x%lx", got_entry);
+            return false;
+        }
+
+#ifdef DEBUG
+        uintptr_t verify;
+        if (!read_remote_memory(tid, got_entry, &verify, sizeof(verify)) || verify != new_func) {
+            LOG_ERR("GOT patch verification failed at 0x%lx", got_entry);
+            return false;
+        }
+#endif
+
+        LOG_INFO("GOT patch applied: %s -> 0x%lx (GOT entry 0x%lx)", func_name.c_str(), new_func, got_entry);
+        return true;
+    }
+
     if (old_func_size < 5) {
         LOG_WARN("Function '%s' is too small (%zu bytes) for jmp patch, skipping", 
                  func_name.c_str(), old_func_size);
@@ -815,40 +843,10 @@ bool DL_Manager::apply_patch(pid_t tid, uintptr_t old_func, uintptr_t new_func,
         LOG_ERR("Patch verification failed at 0x%lx", old_func);
         return false;
     }
-    LOG_DBG("Patch verified at 0x%lx", old_func);
 #endif
 
     LOG_INFO("JMP patch applied: 0x%lx -> 0x%lx (%s)", old_func, new_func, func_name.c_str());
     return true;
-}
-
-void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
-                                        const std::string& new_lib_path,
-                                        pid_t tid,
-                                        struct user_regs_struct& saved_regs) {
-    LOG_DBG("Cleaning up old libraries...");
-    
-    std::set<std::string> to_unload;
-    for (const auto& pair : tracked_libraries_) {
-        const TrackedLibrary& lib = pair.second;
-        if (lib.path == new_lib_path) continue;
-        if (lib.path == target_lib_path && lib.is_original) continue;
-        if (!lib.is_active && !lib.is_original) {
-            to_unload.insert(lib.path);
-        }
-    }
-    
-    for (const std::string& path : to_unload) {
-        auto it = tracked_libraries_.find(path);
-        if (it != tracked_libraries_.end() && it->second.handle != 0) {
-            LOG_INFO("Unloading unused library: %s", path.c_str());
-            if (unload_library_by_handle(tid, it->second.handle, saved_regs)) {
-                tracked_libraries_.erase(it);
-            } else {
-                LOG_ERR("Failed to unload %s", path.c_str());
-            }
-        }
-    }
 }
 
 void DL_Manager::print_library_tracker() const {
@@ -944,7 +942,8 @@ bool DL_Manager::apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_
             if (old_func_addr != new_func_addr) {
                 LOG_DBG("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
                         func_name.c_str(), old_func_addr, new_func_addr, sym.size);
-                if (apply_patch(tid, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
+                // Передаём old_base, old_func_addr, new_func_addr, sym.size, ...
+                if (apply_patch(tid, old_base, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
                     patched_functions.push_back(func_name);
                 } else {
                     LOG_ERR("Failed to patch %s", func_name.c_str());
@@ -976,7 +975,7 @@ bool DL_Manager::apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_
         LOG_DBG("Target function at 0x%lx, new at 0x%lx, size=%zu", old_func, new_func, old_size);
         
         if (old_func != new_func) {
-            all_success = apply_patch(tid, old_func, new_func, old_size, target_function, saved_regs);
+            all_success = apply_patch(tid, old_base, old_func, new_func, old_size, target_function, saved_regs);
             if (all_success) {
                 tracked_libraries_[new_lib_path].provided_functions.push_back(target_function);
             }
@@ -1100,6 +1099,35 @@ bool DL_Manager::wait_for_threads_to_leave_library(const std::vector<pid_t>& all
     return true;
 }
 
+void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
+                                        const std::string& new_lib_path,
+                                        pid_t tid,
+                                        struct user_regs_struct& saved_regs) {
+    LOG_DBG("Cleaning up old libraries...");
+    
+    std::set<std::string> to_unload;
+    for (const auto& pair : tracked_libraries_) {
+        const TrackedLibrary& lib = pair.second;
+        if (lib.path == new_lib_path) continue;
+        if (lib.path == target_lib_path && lib.is_original) continue;
+        if (!lib.is_active && !lib.is_original) {
+            to_unload.insert(lib.path);
+        }
+    }
+    
+    for (const std::string& path : to_unload) {
+        auto it = tracked_libraries_.find(path);
+        if (it != tracked_libraries_.end() && it->second.handle != 0) {
+            LOG_INFO("Unloading unused library: %s", path.c_str());
+            if (unload_library_by_handle(tid, it->second.handle, saved_regs)) {
+                tracked_libraries_.erase(it);
+            } else {
+                LOG_ERR("Failed to unload %s", path.c_str());
+            }
+        }
+    }
+}
+
 bool DL_Manager::replace_library(const std::string& target_lib_pattern,
                                   const std::string& new_lib_path,
                                   const std::string& target_function) {
@@ -1172,58 +1200,41 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
     }
 
-   // Prepare worker thread for remote execution (bring it out of kernel)
-for (int i = 0; i < 2; ++i) {
-    if (ptrace(PTRACE_SYSCALL, worker_tid, nullptr, nullptr) == -1) {
-        LOG_ERR("ptrace SYSCALL failed during preparation");
-        restore_and_detach_all(contexts);
-        return false;
-    }
-    int status;
-    waitpid(worker_tid, &status, 0);
-    if (!WIFSTOPPED(status)) {
-        LOG_ERR("Thread did not stop after PTRACE_SYSCALL (attempt %d)", i);
-        restore_and_detach_all(contexts);
-        return false;
-    }
-}
-
-// After preparation, read the current registers (they might have changed)
-struct user_regs_struct prepared_regs;
-if (ptrace(PTRACE_GETREGS, worker_tid, nullptr, &prepared_regs) == -1) {
-    LOG_ERR("Failed to get registers after preparation");
-    restore_and_detach_all(contexts);
-    return false;
-}
-
-LOG_INFO("Prepared RIP=0x%llx, RSP=0x%llx", (unsigned long long)prepared_regs.rip, 
-         (unsigned long long)prepared_regs.rsp);
-
-// Verify that RSP points to a valid stack region
-std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
-std::ifstream maps_file(maps_path);
-bool rsp_valid = false;
-if (maps_file.is_open()) {
-    std::string line;
-    while (std::getline(maps_file, line)) {
-        if (line.find("[stack]") != std::string::npos) {
-            size_t dash = line.find('-');
-            if (dash != std::string::npos) {
-                uintptr_t start = std::stoull(line.substr(0, dash), nullptr, 16);
-                uintptr_t end = std::stoull(line.substr(dash + 1), nullptr, 16);
-                if (prepared_regs.rsp >= start && prepared_regs.rsp < end) {
-                    rsp_valid = true;
-                    break;
-                }
-            }
+    // Prepare worker thread for remote execution (bring it out of kernel)
+    for (int i = 0; i < 2; ++i) {
+        if (ptrace(PTRACE_SYSCALL, worker_tid, nullptr, nullptr) == -1) {
+            LOG_ERR("ptrace SYSCALL failed during preparation");
+            restore_and_detach_all(contexts);
+            return false;
+        }
+        int status;
+        waitpid(worker_tid, &status, 0);
+        if (!WIFSTOPPED(status)) {
+            LOG_ERR("Thread did not stop after PTRACE_SYSCALL (attempt %d)", i);
+            restore_and_detach_all(contexts);
+            return false;
         }
     }
-    if (!rsp_valid) {
-        // Check other RW regions that might be stacks
-        maps_file.clear();
-        maps_file.seekg(0);
+
+    // After preparation, read the current registers (they might have changed)
+    struct user_regs_struct prepared_regs;
+    if (ptrace(PTRACE_GETREGS, worker_tid, nullptr, &prepared_regs) == -1) {
+        LOG_ERR("Failed to get registers after preparation");
+        restore_and_detach_all(contexts);
+        return false;
+    }
+
+    LOG_INFO("Prepared RIP=0x%llx, RSP=0x%llx", (unsigned long long)prepared_regs.rip, 
+             (unsigned long long)prepared_regs.rsp);
+
+    // Verify that RSP points to a valid stack region
+    std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
+    std::ifstream maps_file(maps_path);
+    bool rsp_valid = false;
+    if (maps_file.is_open()) {
+        std::string line;
         while (std::getline(maps_file, line)) {
-            if (line.find("rw-p") != std::string::npos) {
+            if (line.find("[stack]") != std::string::npos) {
                 size_t dash = line.find('-');
                 if (dash != std::string::npos) {
                     uintptr_t start = std::stoull(line.substr(0, dash), nullptr, 16);
@@ -1235,30 +1246,47 @@ if (maps_file.is_open()) {
                 }
             }
         }
+        if (!rsp_valid) {
+            // Check other RW regions that might be stacks
+            maps_file.clear();
+            maps_file.seekg(0);
+            while (std::getline(maps_file, line)) {
+                if (line.find("rw-p") != std::string::npos) {
+                    size_t dash = line.find('-');
+                    if (dash != std::string::npos) {
+                        uintptr_t start = std::stoull(line.substr(0, dash), nullptr, 16);
+                        uintptr_t end = std::stoull(line.substr(dash + 1), nullptr, 16);
+                        if (prepared_regs.rsp >= start && prepared_regs.rsp < end) {
+                            rsp_valid = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
-}
-if (!rsp_valid) {
-    LOG_WARN("RSP 0x%llx may not be in a valid stack region, injection might fail", 
-             (unsigned long long)prepared_regs.rsp);
-}
+    if (!rsp_valid) {
+        LOG_WARN("RSP 0x%llx may not be in a valid stack region, injection might fail", 
+                 (unsigned long long)prepared_regs.rsp);
+    }
 
-// Use prepared_regs for injection, not the old saved_regs
-struct user_regs_struct saved_regs = prepared_regs;
+    // Use prepared_regs for injection, not the old saved_regs
+    struct user_regs_struct saved_regs = prepared_regs;
 
-// Test syscall mechanism (this will use the prepared thread)
-if (!test_syscall(worker_tid)) {
-    LOG_ERR("Syscall test failed");
-    restore_and_detach_all(contexts);
-    return false;
-}
+    // Test syscall mechanism (this will use the prepared thread)
+    if (!test_syscall(worker_tid)) {
+        LOG_ERR("Syscall test failed");
+        restore_and_detach_all(contexts);
+        return false;
+    }
 
-// Load the new library using the prepared registers
-uintptr_t new_lib_base = 0, new_handle = 0;
-if (!ensure_new_library_loaded(worker_tid, new_lib_path, new_lib_base, new_handle, saved_regs)) {
-    LOG_ERR("Failed to load new library");
-    restore_and_detach_all(contexts);
-    return false;
-} 
+    // Load the new library using the prepared registers
+    uintptr_t new_lib_base = 0, new_handle = 0;
+    if (!ensure_new_library_loaded(worker_tid, new_lib_path, new_lib_base, new_handle, saved_regs)) {
+        LOG_ERR("Failed to load new library");
+        restore_and_detach_all(contexts);
+        return false;
+    } 
 
     // Apply all patches
     bool patch_success = apply_all_patches(worker_tid, target_info.base_addr, new_lib_base,

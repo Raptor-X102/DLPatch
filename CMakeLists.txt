@@ -54,3 +54,22 @@ message(STATUS "Build configuration:")
 message(STATUS "  Libraries will be installed to: ${CMAKE_INSTALL_PREFIX}/lib")
 message(STATUS "  Executables will be installed to: ${CMAKE_INSTALL_PREFIX}/bin")
 message(STATUS "  Library versions: v1 (math_ops), v2 (math_ops_v2), v3 (math_ops_v3)")
+
+# Маленькая тестовая библиотека для GOT-патча
+add_library(tiny_math_ops_v1 SHARED lib_target/tiny_math_ops_v1.cpp)
+target_include_directories(tiny_math_ops_v1 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
+set_target_properties(tiny_math_ops_v1 PROPERTIES OUTPUT_NAME "tiny_math_ops_v1" PREFIX "lib")
+
+add_library(tiny_math_ops_v2 SHARED lib_target/tiny_math_ops_v2.cpp)
+target_include_directories(tiny_math_ops_v2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
+set_target_properties(tiny_math_ops_v2 PROPERTIES OUTPUT_NAME "tiny_math_ops_v2" PREFIX "lib")
+
+# Целевая программа для маленькой библиотеки
+add_executable(target_program_tiny src/target_program_tiny.cpp)
+target_include_directories(target_program_tiny PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
+target_link_libraries(target_program_tiny PRIVATE tiny_math_ops_v1 dl)
+
+# Программа для замены маленькой библиотеки
+add_executable(tiny_scanner_test src/tiny_scanner_test.cpp)
+target_include_directories(tiny_scanner_test PRIVATE headers ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
+target_link_libraries(tiny_scanner_test PRIVATE dl)

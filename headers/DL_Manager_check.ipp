@@ -85,14 +85,6 @@ static long ptrace_read(pid_t tid, uintptr_t addr) {
     return data;
 }
 
-// Helper functions
-static bool address_in_library(uintptr_t addr, const std::vector<std::pair<uintptr_t, uintptr_t>>& segments) {
-    for (const auto& seg : segments) {
-        if (addr >= seg.first && addr < seg.second) return true;
-    }
-    return false;
-}
-
 static bool stack_contains_library(pid_t tid, uintptr_t rsp,
                                    const std::vector<std::pair<uintptr_t, uintptr_t>>& segments) {
     StackInfo stack = get_thread_stack_info(tid);
