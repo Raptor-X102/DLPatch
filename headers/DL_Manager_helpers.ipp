@@ -1,7 +1,22 @@
+#ifndef DL_MANAGER_HELPERS_IPP
+#define DL_MANAGER_HELPERS_IPP
+
 #include <sys/uio.h>
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <cctype>
+#include <vector>
 
+// Trim whitespace from both ends of a string
+static inline std::string trim(const std::string& s) {
+    auto start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    auto end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+// Functions for reading process memory
 static bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
     struct iovec local = {buffer, size};
     struct iovec remote = {reinterpret_cast<void*>(addr), size};
@@ -14,13 +29,7 @@ static bool read_struct(pid_t pid, uintptr_t addr, T& value) {
     return read_process_memory(pid, addr, &value, sizeof(T));
 }
 
-static inline std::string trim(const std::string &s) {
-    auto start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
-    auto end = s.find_last_not_of(" \t\r\n");
-    return s.substr(start, end - start + 1);
-}
-
+// Read string from process memory
 static std::string read_string(pid_t pid, uintptr_t addr, size_t max_len = 256) {
     std::string result;
     char ch;
@@ -31,9 +40,13 @@ static std::string read_string(pid_t pid, uintptr_t addr, size_t max_len = 256) 
     return result;
 }
 
+// Check if address is inside library segments
 static bool address_in_library(uintptr_t addr, const std::vector<std::pair<uintptr_t, uintptr_t>>& segments) {
     for (const auto& seg : segments) {
         if (addr >= seg.first && addr < seg.second) return true;
     }
     return false;
 }
+
+extern uintptr_t get_symbol_address(pid_t pid, uintptr_t lib_base, const std::string& sym_name);
+#endif // DL_MANAGER_HELPERS_IPP

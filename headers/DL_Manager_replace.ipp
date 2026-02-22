@@ -1,4 +1,4 @@
-// Updated DL_manager_replace.ipp with fixed stop_all_threads calls
+// Updated DL_manager_replace.ipp with architecture abstraction
 
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <set>
+#include <algorithm>
 
 // Constants
 static const size_t REMOTE_MEM_SIZE = 4096;
@@ -57,7 +58,7 @@ static bool stop_all_threads(const std::vector<pid_t>& tids, std::vector<ThreadC
 static bool all_threads_outside(const std::vector<ThreadContext>& contexts,
                                 const std::vector<std::pair<uintptr_t, uintptr_t>>& segments) {
     for (const auto& ctx : contexts) {
-        if (address_in_library(ctx.regs.rip, segments)) {
+        if (address_in_library(Arch::get_ip(ctx.regs), segments)) {
             return false;
         }
     }
@@ -163,87 +164,23 @@ static bool read_remote_memory(pid_t pid, uintptr_t addr, void* buffer, size_t s
     return n == static_cast<ssize_t>(size);
 }
 
-static bool remote_syscall(pid_t pid, uintptr_t& result,
-                           long number,
-                           uintptr_t arg1, uintptr_t arg2,
-                           uintptr_t arg3, uintptr_t arg4,
-                           uintptr_t arg5, uintptr_t arg6,
-                           uintptr_t syscall_insn_addr) {
-    struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1) {
-        LOG_ERR("ptrace GETREGS failed");
-        return false;
-    }
-
-    struct user_regs_struct saved_regs = regs;
-
-    regs.rax = number;
-    regs.rdi = arg1;
-    regs.rsi = arg2;
-    regs.rdx = arg3;
-    regs.r10 = arg4;
-    regs.r8  = arg5;
-    regs.r9  = arg6;
-    regs.rip = syscall_insn_addr;
-
-    if (ptrace(PTRACE_SETREGS, pid, nullptr, &regs) == -1) {
-        LOG_ERR("ptrace SETREGS failed");
-        return false;
-    }
-
-    if (ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr) == -1) {
-        LOG_ERR("ptrace SINGLESTEP failed");
-        ptrace(PTRACE_SETREGS, pid, nullptr, &saved_regs);
-        return false;
-    }
-
-    int status;
-    waitpid(pid, &status, 0);
-
-    if (WIFEXITED(status) || WIFSIGNALED(status)) {
-        LOG_ERR("Process terminated during syscall");
-        return false;
-    }
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        LOG_ERR("Unexpected stop after syscall: signal=%d", WSTOPSIG(status));
-        ptrace(PTRACE_SETREGS, pid, nullptr, &saved_regs);
-        return false;
-    }
-
-    if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1) {
-        LOG_ERR("ptrace GETREGS after syscall failed");
-        ptrace(PTRACE_SETREGS, pid, nullptr, &saved_regs);
-        return false;
-    }
-    result = regs.rax;
-
-    ptrace(PTRACE_SETREGS, pid, nullptr, &saved_regs);
-    return true;
+bool DL_Manager::read_remote_memory_raw(uintptr_t addr, void* buffer, size_t size) const {
+    return read_remote_memory(pid_, addr, buffer, size);
 }
 
 static uintptr_t remote_mmap(pid_t pid, size_t length, int prot, int flags, int fd, off_t offset,
                              uintptr_t syscall_insn_addr) {
     uintptr_t result;
-    if (!remote_syscall(pid, result, 9, 0, length, prot, flags, fd, offset, syscall_insn_addr)) {
+    if (!Arch::remote_syscall(pid, result, Arch::SYS_MMAP, 0, length, prot, flags, fd, offset, syscall_insn_addr))
         return 0;
-    }
-    if (result == ~0ULL) {
-        LOG_ERR("remote mmap failed");
-        return 0;
-    }
     return result;
 }
 
 static bool remote_munmap(pid_t pid, uintptr_t addr, size_t length, uintptr_t syscall_insn_addr) {
     uintptr_t result;
-    if (!remote_syscall(pid, result, 11, addr, length, 0, 0, 0, 0, syscall_insn_addr)) {
+    if (!Arch::remote_syscall(pid, result, Arch::SYS_MUNMAP, addr, length, 0, 0, 0, 0, syscall_insn_addr))
         return false;
-    }
-    if (result != 0) {
-        LOG_ERR("remote munmap failed");
-        return false;
-    }
-    return true;
+    return result == 0;
 }
 
 // ============================================================================
@@ -266,47 +203,7 @@ void DL_Manager::init_addresses() {
 }
 
 uintptr_t DL_Manager::find_syscall_instruction(uintptr_t libc_base) {
-    uintptr_t syscall_func = get_symbol_address(libc_base, "syscall");
-    if (syscall_func == 0) {
-        LOG_ERR("Failed to find syscall symbol");
-        return 0;
-    }
-    
-    unsigned char buffer[64];
-    if (!read_remote_memory(pid_, syscall_func, buffer, sizeof(buffer))) {
-        LOG_ERR("Failed to read syscall function");
-        return 0;
-    }
-    
-    for (int i = 0; i < (int)sizeof(buffer) - 1; ++i) {
-        if (buffer[i] == 0x0f && buffer[i+1] == 0x05) {
-            uintptr_t candidate = syscall_func + i;
-            std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
-            std::ifstream maps_file(maps_path);
-            if (maps_file.is_open()) {
-                std::string line;
-                while (std::getline(maps_file, line)) {
-                    size_t dash = line.find('-');
-                    if (dash == std::string::npos) continue;
-                    uintptr_t start = std::stoul(line.substr(0, dash), nullptr, 16);
-                    size_t space = line.find(' ', dash);
-                    if (space == std::string::npos) continue;
-                    uintptr_t end = std::stoul(line.substr(dash + 1, space - dash - 1), nullptr, 16);
-                    if (candidate >= start && candidate < end) {
-                        size_t perms_start = space + 1;
-                        size_t perms_end = line.find(' ', perms_start);
-                        std::string perms = line.substr(perms_start, perms_end - perms_start);
-                        if (perms.find('x') != std::string::npos) {
-                            LOG_INFO("Found syscall instruction at 0x%lx", candidate);
-                            return candidate;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    LOG_ERR("No syscall instruction found in first 64 bytes");
-    return 0;
+    return Arch::find_syscall_instruction(this, libc_base);
 }
 
 bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_t& base_addr, uintptr_t& handle) {
@@ -338,11 +235,8 @@ bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_
 bool DL_Manager::test_syscall(pid_t tid) {
     if (syscall_insn_ == 0) return false;
     uintptr_t result;
-    if (!remote_syscall(tid, result, 39, 0, 0, 0, 0, 0, 0, syscall_insn_)) {
-        LOG_ERR("Test syscall failed");
+    if (!Arch::remote_syscall(tid, result, Arch::SYS_GETPID, 0, 0, 0, 0, 0, 0, syscall_insn_))
         return false;
-    }
-    LOG_DBG("Test getpid returned %lu", result);
     return true;
 }
 
@@ -411,48 +305,15 @@ uintptr_t DL_Manager::allocate_remote_memory(pid_t tid, size_t size) {
 
 bool DL_Manager::write_shellcode_with_verification(pid_t tid, uintptr_t shellcode_addr,
                                                    uintptr_t path_addr, uintptr_t result_addr) {
-    unsigned char shellcode[] = {
-        0x55,                               // push rbp
-        0x48, 0x89, 0xe5,                   // mov rbp, rsp
-        0x57,                               // push rdi
-        0x56,                               // push rsi
-        0x50,                               // push rax
-        0x48, 0x83, 0xec, 0x08,             // sub rsp, 8     
-        
-        0x48, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rdi, path_addr
-        0x48, 0xc7, 0xc6, 0x02, 0x00, 0x00, 0x00,                    // mov rsi, 2 (RTLD_NOW)
-        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, dlopen_addr
-        0xff, 0xd0,                                                    // call rax
-        
-        0x48, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rdi, result_addr
-        0x48, 0x89, 0x07,                                              // mov [rdi], rax
-        
-        0x48, 0x83, 0xc4, 0x08,             // add rsp, 8     
-        0x58,                               // pop rax
-        0x5e,                               // pop rsi
-        0x5f,                               // pop rdi
-        0x5d,                               // pop rbp
-        0xcc,                               // int3
-        0xc3                                // ret
-    };
+    auto shellcode = Arch::generate_dlopen_shellcode(path_addr, dlopen_addr_, result_addr);
     
-    const size_t PATH_OFFSET = 13;      // after sub rsp,8 and opcode mov rdi (48 bf)
-    const size_t DLOPEN_OFFSET = 30;    // after  mov rsi and opcode mov rax (48 b8)
-    const size_t RESULT_OFFSET = 42;    // after call and opcode 2nd mov rdi (48 bf)
+    LOG_DBG("Shellcode size: %zu bytes", shellcode.size());
     
-    LOG_DBG("Shellcode layout: PATH_OFFSET=%zu, DLOPEN_OFFSET=%zu, RESULT_OFFSET=%zu",
-            PATH_OFFSET, DLOPEN_OFFSET, RESULT_OFFSET);
-    LOG_DBG("Shellcode size: %zu bytes", sizeof(shellcode));
-    
-    *reinterpret_cast<uintptr_t*>(shellcode + PATH_OFFSET) = path_addr;
-    *reinterpret_cast<uintptr_t*>(shellcode + DLOPEN_OFFSET) = dlopen_addr_;
-    *reinterpret_cast<uintptr_t*>(shellcode + RESULT_OFFSET) = result_addr;    
-
     LOG_DBG("Shellcode before writing:");
-    for (size_t i = 0; i < sizeof(shellcode); i += 8) {
-        size_t chunk = std::min(sizeof(shellcode) - i, size_t(8));
+    for (size_t i = 0; i < shellcode.size(); i += 8) {
+        size_t chunk = std::min(shellcode.size() - i, size_t(8));
         uint64_t val = 0;
-        memcpy(&val, shellcode + i, chunk);
+        memcpy(&val, &shellcode[i], chunk);
         LOG_DBG("  offset %3zu: 0x%016lx", i, val);
     }
     
@@ -473,31 +334,14 @@ bool DL_Manager::write_shellcode_with_verification(pid_t tid, uintptr_t shellcod
     write_remote_memory(tid, result_addr, &test_val, sizeof(test_val));
     LOG_DBG("result_addr is writable");
     
-    if (!write_remote_memory(tid, shellcode_addr, shellcode, sizeof(shellcode))) {
-        LOG_ERR("Failed to write shellcode");
+    if (!write_remote_memory(tid, shellcode_addr, shellcode.data(), shellcode.size()))
         return false;
-    }
     
-    unsigned char verify[sizeof(shellcode)];
-    if (!read_remote_memory(tid, shellcode_addr, verify, sizeof(verify))) {
-        LOG_ERR("Failed to read back shellcode for verification");
+    std::vector<uint8_t> verify(shellcode.size());
+    if (!read_remote_memory(tid, shellcode_addr, verify.data(), verify.size()))
         return false;
-    }
-    
-    if (memcmp(verify, shellcode, sizeof(shellcode)) != 0) {
-        LOG_ERR("Shellcode verification failed!");
-        for (size_t i = 0; i < sizeof(shellcode); i += 8) {
-            size_t chunk = std::min(sizeof(shellcode) - i, size_t(8));
-            uint64_t orig = 0, ver = 0;
-            memcpy(&orig, shellcode + i, chunk);
-            memcpy(&ver, verify + i, chunk);
-            if (orig != ver) {
-                LOG_ERR("  Mismatch at offset %zu: wrote 0x%016lx, read 0x%016lx", 
-                        i, orig, ver);
-            }
-        }
+    if (memcmp(verify.data(), shellcode.data(), shellcode.size()) != 0)
         return false;
-    }
     
     LOG_DBG("Shellcode written and verified successfully");
     return true;
@@ -507,9 +351,9 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
                                                    struct user_regs_struct& saved_regs,
                                                    uintptr_t& out_handle) {
     struct user_regs_struct new_regs = saved_regs;
-    new_regs.rip = shellcode_addr;
+    Arch::set_ip(new_regs, shellcode_addr);
     
-    LOG_DBG("Setting RIP to 0x%lx, original RSP=0x%lx", shellcode_addr, saved_regs.rsp);
+    LOG_DBG("Setting IP to 0x%lx, original SP=0x%lx", shellcode_addr, Arch::get_sp(saved_regs));
     
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &new_regs) == -1) {
         LOG_ERR("ptrace SETREGS failed: %s", strerror(errno));
@@ -560,14 +404,14 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
                 struct user_regs_struct fault_regs;
                 if (ptrace(PTRACE_GETREGS, tid, nullptr, &fault_regs) == 0) {
                     LOG_ERR("Fault registers:");
-                    LOG_ERR("  RIP=0x%llx", (unsigned long long)fault_regs.rip);
-                    LOG_ERR("  RSP=0x%llx", (unsigned long long)fault_regs.rsp);
+                    LOG_ERR("  IP=0x%llx", (unsigned long long)Arch::get_ip(fault_regs));
+                    LOG_ERR("  SP=0x%llx", (unsigned long long)Arch::get_sp(fault_regs));
                     LOG_ERR("  RAX=0x%llx", (unsigned long long)fault_regs.rax);
                     LOG_ERR("  RDI=0x%llx", (unsigned long long)fault_regs.rdi);
                     LOG_ERR("  RSI=0x%llx", (unsigned long long)fault_regs.rsi);
                     
                     unsigned char code_dump[32];
-                    uintptr_t dump_addr = fault_regs.rip & ~0xf;
+                    uintptr_t dump_addr = Arch::get_ip(fault_regs) & ~0xf;
                     if (read_remote_memory(tid, dump_addr, code_dump, sizeof(code_dump))) {
                         LOG_ERR("Code around fault address:");
                         for (int i = 0; i < 32; i += 8) {
@@ -625,9 +469,8 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     LOG_INFO("load_new_library: tid=%d, lib_path=%s", tid, lib_path.c_str());
     LOG_INFO("dlopen_addr=0x%lx, syscall_insn=0x%lx", dlopen_addr_, syscall_insn_);
 
-    // Test syscall mechanism first
     uintptr_t test_result;
-    if (!remote_syscall(tid, test_result, 39, 0, 0, 0, 0, 0, 0, syscall_insn_)) {
+    if (!Arch::remote_syscall(tid, test_result, Arch::SYS_GETPID, 0, 0, 0, 0, 0, 0, syscall_insn_)) {
         LOG_ERR("remote_syscall test failed before allocation");
         return 0;
     }
@@ -652,7 +495,6 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     }
     LOG_INFO("Library path written to 0x%lx", path_addr);
 
-    // Verify path was written correctly
     char path_check[256] = {0};
     if (read_remote_memory(tid, path_addr, path_check, lib_path.size() + 1)) {
         LOG_INFO("Path verification: %s", path_check);
@@ -665,7 +507,6 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     }
     LOG_INFO("Shellcode written to 0x%lx", remote_mem);
 
-    // Execute shellcode and get handle
     if (!execute_shellcode_and_get_handle(tid, remote_mem, saved_regs, out_handle)) {
         LOG_ERR("execute_shellcode_and_get_handle failed");
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
@@ -707,43 +548,18 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    unsigned char shellcode[] = {
-        0x55,                               // push rbp
-        0x48, 0x89, 0xe5,                   // mov rbp, rsp
-        0x57,                               // push rdi
-        0x50,                               // push rax
-        0x48, 0x83, 0xec, 0x08,             // sub rsp, 8     ; align
-        
-        0x48, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rdi, handle
-        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, dlclose_addr
-        0xff, 0xd0,                                                    // call rax
-        
-        0x48, 0x83, 0xc4, 0x08,             // add rsp, 8     ; restore stack
-        0x58,                               // pop rax
-        0x5f,                               // pop rdi
-        0x5d,                               // pop rbp
-        0xcc,                               // int3
-        0xc3                                // ret
-    };
+    auto shellcode = Arch::generate_dlclose_shellcode(handle, dlclose_addr_);
     
-    const size_t HANDLE_OFFSET = 19;      // after sub rsp,8 and opcode mov rdi
-    const size_t DLCLOSE_OFFSET = 29;     // after mov rdi and opcode mov rax
+    LOG_DBG("Unload shellcode size: %zu bytes", shellcode.size());
     
-    *reinterpret_cast<uintptr_t*>(shellcode + HANDLE_OFFSET) = handle;
-    *reinterpret_cast<uintptr_t*>(shellcode + DLCLOSE_OFFSET) = dlclose_addr_;
-    
-    LOG_DBG("Unload shellcode: HANDLE_OFFSET=%zu, DLCLOSE_OFFSET=%zu", 
-            HANDLE_OFFSET, DLCLOSE_OFFSET);
-    LOG_DBG("Shellcode size: %zu bytes", sizeof(shellcode));
-    
-    if (!write_remote_memory(tid, remote_mem, shellcode, sizeof(shellcode))) {
+    if (!write_remote_memory(tid, remote_mem, shellcode.data(), shellcode.size())) {
         LOG_ERR("Failed to write unload shellcode");
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
     struct user_regs_struct new_regs = saved_regs;
-    new_regs.rip = remote_mem;
+    Arch::set_ip(new_regs, remote_mem);
     
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &new_regs) == -1) {
         LOG_ERR("ptrace SETREGS for unload failed");
@@ -769,7 +585,6 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
             success = true;
         } else {
             LOG_WARN("Unload thread stopped with signal %d, assuming success", sig);
-            
             success = true;
         }
     } else if (WIFEXITED(status)) {
@@ -833,7 +648,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         return false;
     }
     
-    // Find main thread
     main_tid = pid_;
     bool found = false;
     for (const auto& ctx : contexts) {
@@ -862,9 +676,8 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
                               uintptr_t new_func, size_t old_func_size,
                               const std::string& func_name,
                               struct user_regs_struct& /*saved_regs*/) {
-    std::string clean_path = trim(target_lib_path);  // ADD THIS LINE
-    // Find tracked library by path
-    auto lib_it = tracked_libraries_.find(clean_path);  // USE clean_path
+    std::string clean_path = trim(target_lib_path);
+    auto lib_it = tracked_libraries_.find(clean_path);
     if (lib_it == tracked_libraries_.end()) {
         LOG_ERR("No tracked library for path %s", clean_path.c_str()); 
         return false;
@@ -873,7 +686,6 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
 
     const size_t THRESHOLD = 16;
 
-    // Use GOT patch for small functions
     if (old_func_size < THRESHOLD) {
         LOG_INFO("GOT patch candidate %s (%zu bytes)", func_name.c_str(), old_func_size);
         uintptr_t got_entry = find_got_entry(target_lib.base_addr, func_name);
@@ -882,7 +694,6 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
             return false;
         }
         
-        // Save original GOT value for rollback
         uintptr_t orig = 0;
         if (!read_remote_memory(pid_, got_entry, &orig, sizeof(orig))) {
             LOG_ERR("Cannot read original GOT");
@@ -890,7 +701,6 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
         }
         target_lib.saved_original_got[func_name] = orig;
 
-        // Write new address to GOT
         if (!write_remote_memory(tid, got_entry, &new_func, sizeof(new_func))) {
             LOG_ERR("GOT write failed");
             return false;
@@ -899,26 +709,24 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
         return true;
     }
 
-    // Use JMP patch for larger functions
     if (old_func_size < 5) {
         LOG_WARN("Function %s too small (%zu)", func_name.c_str(), old_func_size);
         return false;
     }
 
-    // Save original bytes for rollback
     uint8_t orig_bytes[5];
     if (!read_remote_memory(pid_, old_func, orig_bytes, 5)) {
         LOG_ERR("Cannot read original bytes");
         return false;
     }
     target_lib.saved_original_bytes[func_name] = std::vector<uint8_t>(orig_bytes, orig_bytes+5);
-
-    // Write JMP instruction
-    int32_t rel32 = static_cast<int32_t>(new_func - (old_func + 5));
-    uint8_t patch[5] = {0xE9, 0,0,0,0};
-    memcpy(patch+1, &rel32, 4);
-
-    if (!write_remote_memory(tid, old_func, patch, 5)) {
+    
+    auto patch = Arch::create_jmp_patch(old_func, new_func);
+    if (patch.size() != 5) {
+        LOG_ERR("Unexpected jmp patch size");
+        return false;
+    }
+    if (!write_remote_memory(tid, old_func, patch.data(), patch.size())) {
         LOG_ERR("JMP write failed");
         return false;
     }
@@ -951,7 +759,6 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
             if (old_func_addr != new_func_addr) {
                 LOG_DBG("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
                         func_name.c_str(), old_func_addr, new_func_addr, sym.size);
-                // Pass target_lib_path
                 if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
                     patched_functions.push_back(func_name);
                 } else {
@@ -984,7 +791,6 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
         LOG_DBG("Target function at 0x%lx, new at 0x%lx, size=%zu", old_func, new_func, old_size);
         
         if (old_func != new_func) {
-            // Pass target_lib_path
             all_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function, saved_regs);
             if (all_success) {
                 tracked_libraries_[new_lib_path].provided_functions.push_back(target_function);
@@ -1069,9 +875,9 @@ bool DL_Manager::wait_for_threads_to_leave_library(const std::vector<pid_t>& all
                 continue;
             }
 
-            bool in_lib = address_in_library(regs.rip, segments);
+            bool in_lib = address_in_library(Arch::get_ip(regs), segments);
             if (in_lib) {
-                LOG_DBG("Thread %d is inside library (RIP=0x%lx), detaching and will retry", tid, regs.rip);
+                LOG_DBG("Thread %d is inside library (IP=0x%lx), detaching and will retry", tid, Arch::get_ip(regs));
                 ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
                 inside[tid] = true;
                 ++it;
@@ -1158,10 +964,8 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-    // Clean the path once and use it everywhere
     std::string clean_target_path = trim(target_info.path);
     
-    // Ensure target library is tracked
     if (tracked_libraries_.find(clean_target_path) == tracked_libraries_.end()) {
         TrackedLibrary target_lib(clean_target_path, 0, target_info.base_addr, std::vector<std::string>());
         target_lib.is_original = true;
@@ -1222,7 +1026,6 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
     }
 
-    // Prepare worker thread for remote execution
     for (int i = 0; i < 2; ++i) {
         if (ptrace(PTRACE_SYSCALL, worker_tid, nullptr, nullptr) == -1) {
             LOG_ERR("ptrace SYSCALL failed during preparation");
@@ -1245,8 +1048,9 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-    LOG_INFO("Prepared RIP=0x%llx, RSP=0x%llx", (unsigned long long)prepared_regs.rip, 
-             (unsigned long long)prepared_regs.rsp);
+    LOG_INFO("Prepared IP=0x%llx, SP=0x%llx", 
+             (unsigned long long)Arch::get_ip(prepared_regs), 
+             (unsigned long long)Arch::get_sp(prepared_regs));
 
     struct user_regs_struct saved_regs = prepared_regs;
 
@@ -1256,7 +1060,6 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-    // Load the new library
     uintptr_t new_lib_base = 0, new_handle = 0;
     if (!ensure_new_library_loaded(worker_tid, new_lib_path, new_lib_base, new_handle, saved_regs)) {
         LOG_ERR("Failed to load new library");
@@ -1264,19 +1067,16 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-    // Apply all patches - USE THE CLEANED PATH
     bool patch_success = apply_all_patches(worker_tid, clean_target_path, target_info.base_addr, new_lib_base,
                                            new_lib_path, target_function, saved_regs);
 
     if (patch_success) {
-        // Update tracker: deactivate all other libraries, activate new one
         for (auto& pair : tracked_libraries_) {
             if (pair.first != new_lib_path) pair.second.is_active = false;
         }
         tracked_libraries_[new_lib_path].is_active = true;
         tracked_libraries_[new_lib_path].patched_libraries.push_back(target_info.path);
 
-        // Clean up unused libraries
         cleanup_old_libraries(clean_target_path, new_lib_path, worker_tid, saved_regs);
     }
 
