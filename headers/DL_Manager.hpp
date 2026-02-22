@@ -26,6 +26,8 @@ struct TrackedLibrary {
     std::vector<std::string> patched_libraries; // libraries that were patched to point to this one
     bool is_active;              // whether this library is currently the target of any patch
     bool is_original;            // whether this is the original library (should never be unloaded)
+    std::map<std::string, std::vector<uint8_t>> saved_original_bytes;
+    std::map<std::string, uintptr_t> saved_original_got;
     
     TrackedLibrary() : handle(0), base_addr(0), is_active(false), is_original(false) {}
     
@@ -87,6 +89,11 @@ public:
     void print_library_tracker() const;
     bool unload_library(const std::string& lib_path);
 
+    void invalidate_cache(uintptr_t lib_base = 0);
+    bool rollback_library(const std::string& lib_path);
+    bool rollback_function(const std::string& lib_path, const std::string& func_name);
+    void print_cache_stats() const;
+
 private:
     pid_t pid_;
     uintptr_t dlopen_addr_;
@@ -115,16 +122,16 @@ private:
                                uintptr_t& out_handle, struct user_regs_struct& saved_regs);
     bool unload_library_by_handle(pid_t tid, uintptr_t handle, struct user_regs_struct& saved_regs);
     
-    bool apply_patch(pid_t tid, uintptr_t old_lib_base, uintptr_t old_func, uintptr_t new_func,
-                     size_t old_func_size, const std::string& func_name,
-                     struct user_regs_struct& saved_regs);
-    
     void cleanup_old_libraries(const std::string& target_lib_path, 
                                const std::string& new_lib_path,
                                pid_t tid,
                                struct user_regs_struct& saved_regs);
     
-    bool apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_base,
+    bool apply_patch(pid_t tid, const std::string& target_lib_path, uintptr_t old_func, uintptr_t new_func,
+                     size_t old_func_size, const std::string& func_name,
+                     struct user_regs_struct& saved_regs);
+    
+    bool apply_all_patches(pid_t tid, const std::string& target_lib_path, uintptr_t old_base, uintptr_t new_base,
                        const std::string& new_lib_path,
                        const std::string& target_function,
                        struct user_regs_struct& saved_regs);
@@ -133,25 +140,38 @@ private:
     bool ensure_new_library_loaded(pid_t tid, const std::string& new_lib_path,
                                    uintptr_t& new_lib_base, uintptr_t& new_handle,
                                    struct user_regs_struct& saved_regs);
-    bool apply_patches_and_update_tracker(pid_t tid, uintptr_t target_base, uintptr_t new_base,
-                                          const std::string& new_lib_path, const std::string& target_func,
-                                          struct user_regs_struct& saved_regs);
-    
+        
     bool wait_for_threads_to_leave_library(const std::vector<pid_t>& all_tids,
                                            const std::vector<std::pair<uintptr_t, uintptr_t>>& segments,
                                            std::vector<pid_t>& stopped_tids,
                                            int max_attempts = 50,
                                            int retry_us = 10000);
 
+    // Cache structure
+    struct CachedLibraryData {
+        std::vector<SymbolInfo> symbols;
+        std::map<std::string, uintptr_t> got_entries;
+        bool parsed;
+        CachedLibraryData() : parsed(false) {}
+    };
+    mutable std::map<uintptr_t, CachedLibraryData> library_cache_;
+    
+    // Cache methods
+    void ensure_cache(uintptr_t lib_base) const;
+    std::vector<SymbolInfo> parse_symbols_from_dynamic(uintptr_t lib_base, const DynamicInfo& info) const;
+    std::map<std::string, uintptr_t> parse_got_entries(uintptr_t lib_base, const DynamicInfo& info) const;
+
     uintptr_t find_got_entry(uintptr_t lib_base, const std::string& sym_name) const;
 };
 
-#include "DL_Manager_helpers.ipp"
-#include "DL_Manager_parse_elf.ipp"
-#include "DL_Manager_get_lib_data.ipp"
-#include "DL_Manager_check.ipp"
-#include "DL_Manager_extract_funcs_from_lib.ipp"
-#include "DL_Manager_replace.ipp"
-#include "DL_Manager_GOT.ipp"
+#include "DL_Manager_helpers.ipp"           // Basic read/write functions
+#include "DL_Manager_parse_elf.ipp"          // ELF parsing (read_elf_header, parse_gnu_hash, parse_dynamic_info)
+#include "DL_Manager_cache.ipp"               // Cache management 
+#include "DL_Manager_GOT.ipp"                 // GOT entry lookup (now uses cache)
+#include "DL_Manager_get_lib_data.ipp"        // get_loaded_libraries, get_library_info
+#include "DL_Manager_check.ipp"                // is_safe_to_replace
+#include "DL_Manager_extract_funcs_from_lib.ipp" // get_symbol_address, get_function_symbols (uses cache)
+#include "DL_Manager_replace.ipp"               // replace_library
+#include "DL_Manager_rollback.ipp"               // rollback methods 
 
-#endif // LIBRARY_SCANNER_HPPendif // LIBRARY_SCANNER_HPP
+#endif // LIBRARY_SCANNER_HPP

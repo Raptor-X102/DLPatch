@@ -22,29 +22,27 @@ int main(int argc, char* argv[]) {
     std::string v1 = base_path + "libtiny_math_ops_v1.so";
     std::string v2 = base_path + "libtiny_math_ops_v2.so";
     
-    print_separator("Testing GOT patch on tiny functions");
+    // 1. Сначала применяем патчи
+    print_separator("Applying patches");
+    bool replace_result = manager.replace_library(v1, v2, "all");
+    std::cout << "Replace result: " << (replace_result ? "SUCCESS" : "FAILURE") << std::endl;
+    manager.print_library_tracker();
     
-    // Получаем базовый адрес библиотеки
-    LibraryInfo info = manager.get_library_info("libtiny_math_ops_v1.so");
-    if (info.base_addr == 0) {
-        std::cerr << "Target library not loaded!" << std::endl;
-        return -1;
-    }
+    // Даем время программе поработать с новыми функциями
+    std::this_thread::sleep_for(std::chrono::seconds(3));
     
-    // Выводим размеры функций
-    std::cout << "\nFunction sizes in original library:\n";
-    std::cout << "  zero: " << manager.get_symbol_size(info.base_addr, "zero") << " bytes\n";
-    std::cout << "  one: " << manager.get_symbol_size(info.base_addr, "one") << " bytes\n";
-    std::cout << "  forty_two: " << manager.get_symbol_size(info.base_addr, "forty_two") << " bytes\n";
-    std::cout << "  max: " << manager.get_symbol_size(info.base_addr, "max") << " bytes\n";
-    std::cout << "  add: " << manager.get_symbol_size(info.base_addr, "add") << " bytes\n";
-    std::cout << "\nThreshold for GOT patch: 16 bytes\n";
+    // 2. Откатываем одну функцию
+    print_separator("Rolling back zero function");
+    bool rollback_func_result = manager.rollback_function(v1, "zero");
+    std::cout << "Rollback zero result: " << (rollback_func_result ? "SUCCESS" : "FAILURE") << std::endl;
+    manager.print_library_tracker();
     
-    // Заменяем все функции
-    std::cout << "\nReplacing all functions with v2...\n";
-    bool result = manager.replace_library(v1, v2, "all");
-    std::cout << "Result: " << (result ? "SUCCESS" : "FAILURE") << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(3));
     
+    // 3. Откатываем все функции
+    print_separator("Rolling back all functions");
+    bool rollback_all_result = manager.rollback_library(v1);
+    std::cout << "Rollback all result: " << (rollback_all_result ? "SUCCESS" : "FAILURE") << std::endl;
     manager.print_library_tracker();
     
     return 0;

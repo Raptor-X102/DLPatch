@@ -14,6 +14,13 @@ static bool read_struct(pid_t pid, uintptr_t addr, T& value) {
     return read_process_memory(pid, addr, &value, sizeof(T));
 }
 
+static inline std::string trim(const std::string &s) {
+    auto start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    auto end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
 static std::string read_string(pid_t pid, uintptr_t addr, size_t max_len = 256) {
     std::string result;
     char ch;

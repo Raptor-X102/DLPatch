@@ -787,68 +787,6 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
     return success;
 }
 
-bool DL_Manager::apply_patch(pid_t tid, uintptr_t old_lib_base, uintptr_t old_func,
-                              uintptr_t new_func, size_t old_func_size,
-                              const std::string& func_name,
-                              struct user_regs_struct& /*saved_regs*/) {
-    const size_t THRESHOLD = 16; // функции меньше этого размера патентуем через GOT
-
-    if (old_func_size < THRESHOLD) {
-        LOG_INFO("Function '%s' is small (%zu bytes), trying GOT patch", func_name.c_str(), old_func_size);
-        uintptr_t got_entry = find_got_entry(old_lib_base, func_name);
-        if (got_entry == 0) {
-            LOG_WARN("No GOT entry found for '%s', cannot patch", func_name.c_str());
-            return false;
-        }
-
-        if (!write_remote_memory(tid, got_entry, &new_func, sizeof(new_func))) {
-            LOG_ERR("Failed to write GOT entry at 0x%lx", got_entry);
-            return false;
-        }
-
-#ifdef DEBUG
-        uintptr_t verify;
-        if (!read_remote_memory(tid, got_entry, &verify, sizeof(verify)) || verify != new_func) {
-            LOG_ERR("GOT patch verification failed at 0x%lx", got_entry);
-            return false;
-        }
-#endif
-
-        LOG_INFO("GOT patch applied: %s -> 0x%lx (GOT entry 0x%lx)", func_name.c_str(), new_func, got_entry);
-        return true;
-    }
-
-    if (old_func_size < 5) {
-        LOG_WARN("Function '%s' is too small (%zu bytes) for jmp patch, skipping", 
-                 func_name.c_str(), old_func_size);
-        return false;
-    }
-
-    int32_t rel32 = static_cast<int32_t>(new_func - (old_func + 5));
-    unsigned char patch[5] = {0xE9, 0, 0, 0, 0};
-    memcpy(patch + 1, &rel32, 4);
-
-    if (!write_remote_memory(tid, old_func, patch, 5)) {
-        LOG_ERR("Failed to write patch at 0x%lx", old_func);
-        return false;
-    }
-
-#ifdef DEBUG
-    unsigned char verify[5];
-    if (!read_remote_memory(tid, old_func, verify, 5)) {
-        LOG_ERR("Failed to read back patch for verification");
-        return false;
-    }
-    if (memcmp(verify, patch, 5) != 0) {
-        LOG_ERR("Patch verification failed at 0x%lx", old_func);
-        return false;
-    }
-#endif
-
-    LOG_INFO("JMP patch applied: 0x%lx -> 0x%lx (%s)", old_func, new_func, func_name.c_str());
-    return true;
-}
-
 void DL_Manager::print_library_tracker() const {
     LOG_INFO("=== Library Tracker Status ===");
     LOG_INFO("Tracked libraries: %zu", tracked_libraries_.size());
@@ -911,17 +849,88 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     }
     
     bool result = unload_library_by_handle(main_tid, lib.handle, saved_regs);
-    if (result) tracked_libraries_.erase(it);
-    
+    if (result) {
+        invalidate_cache(lib.base_addr);  
+        tracked_libraries_.erase(it);
+    } 
     restore_and_detach_all(contexts);
     
     return result;
 }
 
-bool DL_Manager::apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_base,
+bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uintptr_t old_func,
+                              uintptr_t new_func, size_t old_func_size,
+                              const std::string& func_name,
+                              struct user_regs_struct& /*saved_regs*/) {
+    std::string clean_path = trim(target_lib_path);  // ADD THIS LINE
+    // Find tracked library by path
+    auto lib_it = tracked_libraries_.find(clean_path);  // USE clean_path
+    if (lib_it == tracked_libraries_.end()) {
+        LOG_ERR("No tracked library for path %s", clean_path.c_str()); 
+        return false;
+    }
+    TrackedLibrary& target_lib = lib_it->second;
+
+    const size_t THRESHOLD = 16;
+
+    // Use GOT patch for small functions
+    if (old_func_size < THRESHOLD) {
+        LOG_INFO("GOT patch candidate %s (%zu bytes)", func_name.c_str(), old_func_size);
+        uintptr_t got_entry = find_got_entry(target_lib.base_addr, func_name);
+        if (got_entry == 0) {
+            LOG_WARN("No GOT entry for %s", func_name.c_str());
+            return false;
+        }
+        
+        // Save original GOT value for rollback
+        uintptr_t orig = 0;
+        if (!read_remote_memory(pid_, got_entry, &orig, sizeof(orig))) {
+            LOG_ERR("Cannot read original GOT");
+            return false;
+        }
+        target_lib.saved_original_got[func_name] = orig;
+
+        // Write new address to GOT
+        if (!write_remote_memory(tid, got_entry, &new_func, sizeof(new_func))) {
+            LOG_ERR("GOT write failed");
+            return false;
+        }
+        LOG_INFO("GOT patched %s -> 0x%lx", func_name.c_str(), new_func);
+        return true;
+    }
+
+    // Use JMP patch for larger functions
+    if (old_func_size < 5) {
+        LOG_WARN("Function %s too small (%zu)", func_name.c_str(), old_func_size);
+        return false;
+    }
+
+    // Save original bytes for rollback
+    uint8_t orig_bytes[5];
+    if (!read_remote_memory(pid_, old_func, orig_bytes, 5)) {
+        LOG_ERR("Cannot read original bytes");
+        return false;
+    }
+    target_lib.saved_original_bytes[func_name] = std::vector<uint8_t>(orig_bytes, orig_bytes+5);
+
+    // Write JMP instruction
+    int32_t rel32 = static_cast<int32_t>(new_func - (old_func + 5));
+    uint8_t patch[5] = {0xE9, 0,0,0,0};
+    memcpy(patch+1, &rel32, 4);
+
+    if (!write_remote_memory(tid, old_func, patch, 5)) {
+        LOG_ERR("JMP write failed");
+        return false;
+    }
+    LOG_INFO("JMP patched %s -> 0x%lx", func_name.c_str(), new_func);
+    return true;
+}
+
+bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path, uintptr_t old_base, uintptr_t new_base,
                                      const std::string& new_lib_path,
                                      const std::string& target_function,
                                      struct user_regs_struct& saved_regs) {
+    std::string clean_target_path = trim(target_lib_path);
     bool all_success = true;
     
     if (target_function == "all") {
@@ -942,8 +951,8 @@ bool DL_Manager::apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_
             if (old_func_addr != new_func_addr) {
                 LOG_DBG("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
                         func_name.c_str(), old_func_addr, new_func_addr, sym.size);
-                // Передаём old_base, old_func_addr, new_func_addr, sym.size, ...
-                if (apply_patch(tid, old_base, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
+                // Pass target_lib_path
+                if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
                     patched_functions.push_back(func_name);
                 } else {
                     LOG_ERR("Failed to patch %s", func_name.c_str());
@@ -975,7 +984,8 @@ bool DL_Manager::apply_all_patches(pid_t tid, uintptr_t old_base, uintptr_t new_
         LOG_DBG("Target function at 0x%lx, new at 0x%lx, size=%zu", old_func, new_func, old_size);
         
         if (old_func != new_func) {
-            all_success = apply_patch(tid, old_base, old_func, new_func, old_size, target_function, saved_regs);
+            // Pass target_lib_path
+            all_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function, saved_regs);
             if (all_success) {
                 tracked_libraries_[new_lib_path].provided_functions.push_back(target_function);
             }
@@ -1016,12 +1026,6 @@ bool DL_Manager::ensure_new_library_loaded(pid_t tid, const std::string& new_lib
         LOG_INFO("Library already loaded, using existing copy.");
     }
     return true;
-}
-
-bool DL_Manager::apply_patches_and_update_tracker(pid_t tid, uintptr_t target_base, uintptr_t new_base,
-                                                  const std::string& new_lib_path, const std::string& target_func,
-                                                  struct user_regs_struct& saved_regs) {
-    return apply_all_patches(tid, target_base, new_base, new_lib_path, target_func, saved_regs);
 }
 
 bool DL_Manager::wait_for_threads_to_leave_library(const std::vector<pid_t>& all_tids,
@@ -1099,6 +1103,12 @@ bool DL_Manager::wait_for_threads_to_leave_library(const std::vector<pid_t>& all
     return true;
 }
 
+void resume_all_threads(const std::vector<pid_t>& tids) {
+    for (pid_t tid : tids) {
+        ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
+    }
+}
+
 void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
                                         const std::string& new_lib_path,
                                         pid_t tid,
@@ -1120,6 +1130,7 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
         if (it != tracked_libraries_.end() && it->second.handle != 0) {
             LOG_INFO("Unloading unused library: %s", path.c_str());
             if (unload_library_by_handle(tid, it->second.handle, saved_regs)) {
+                invalidate_cache(it->second.base_addr);
                 tracked_libraries_.erase(it);
             } else {
                 LOG_ERR("Failed to unload %s", path.c_str());
@@ -1145,6 +1156,17 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     if (target_info.base_addr == 0) {
         LOG_ERR("Target library not found");
         return false;
+    }
+
+    // Clean the path once and use it everywhere
+    std::string clean_target_path = trim(target_info.path);
+    
+    // Ensure target library is tracked
+    if (tracked_libraries_.find(clean_target_path) == tracked_libraries_.end()) {
+        TrackedLibrary target_lib(clean_target_path, 0, target_info.base_addr, std::vector<std::string>());
+        target_lib.is_original = true;
+        tracked_libraries_[clean_target_path] = target_lib;
+        LOG_INFO("Added target library to tracker: %s", clean_target_path.c_str());
     }
 
     if (new_lib_path == target_info.path) {
@@ -1200,7 +1222,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
     }
 
-    // Prepare worker thread for remote execution (bring it out of kernel)
+    // Prepare worker thread for remote execution
     for (int i = 0; i < 2; ++i) {
         if (ptrace(PTRACE_SYSCALL, worker_tid, nullptr, nullptr) == -1) {
             LOG_ERR("ptrace SYSCALL failed during preparation");
@@ -1216,7 +1238,6 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         }
     }
 
-    // After preparation, read the current registers (they might have changed)
     struct user_regs_struct prepared_regs;
     if (ptrace(PTRACE_GETREGS, worker_tid, nullptr, &prepared_regs) == -1) {
         LOG_ERR("Failed to get registers after preparation");
@@ -1227,69 +1248,24 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     LOG_INFO("Prepared RIP=0x%llx, RSP=0x%llx", (unsigned long long)prepared_regs.rip, 
              (unsigned long long)prepared_regs.rsp);
 
-    // Verify that RSP points to a valid stack region
-    std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
-    std::ifstream maps_file(maps_path);
-    bool rsp_valid = false;
-    if (maps_file.is_open()) {
-        std::string line;
-        while (std::getline(maps_file, line)) {
-            if (line.find("[stack]") != std::string::npos) {
-                size_t dash = line.find('-');
-                if (dash != std::string::npos) {
-                    uintptr_t start = std::stoull(line.substr(0, dash), nullptr, 16);
-                    uintptr_t end = std::stoull(line.substr(dash + 1), nullptr, 16);
-                    if (prepared_regs.rsp >= start && prepared_regs.rsp < end) {
-                        rsp_valid = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (!rsp_valid) {
-            // Check other RW regions that might be stacks
-            maps_file.clear();
-            maps_file.seekg(0);
-            while (std::getline(maps_file, line)) {
-                if (line.find("rw-p") != std::string::npos) {
-                    size_t dash = line.find('-');
-                    if (dash != std::string::npos) {
-                        uintptr_t start = std::stoull(line.substr(0, dash), nullptr, 16);
-                        uintptr_t end = std::stoull(line.substr(dash + 1), nullptr, 16);
-                        if (prepared_regs.rsp >= start && prepared_regs.rsp < end) {
-                            rsp_valid = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (!rsp_valid) {
-        LOG_WARN("RSP 0x%llx may not be in a valid stack region, injection might fail", 
-                 (unsigned long long)prepared_regs.rsp);
-    }
-
-    // Use prepared_regs for injection, not the old saved_regs
     struct user_regs_struct saved_regs = prepared_regs;
 
-    // Test syscall mechanism (this will use the prepared thread)
     if (!test_syscall(worker_tid)) {
         LOG_ERR("Syscall test failed");
         restore_and_detach_all(contexts);
         return false;
     }
 
-    // Load the new library using the prepared registers
+    // Load the new library
     uintptr_t new_lib_base = 0, new_handle = 0;
     if (!ensure_new_library_loaded(worker_tid, new_lib_path, new_lib_base, new_handle, saved_regs)) {
         LOG_ERR("Failed to load new library");
         restore_and_detach_all(contexts);
         return false;
-    } 
+    }
 
-    // Apply all patches
-    bool patch_success = apply_all_patches(worker_tid, target_info.base_addr, new_lib_base,
+    // Apply all patches - USE THE CLEANED PATH
+    bool patch_success = apply_all_patches(worker_tid, clean_target_path, target_info.base_addr, new_lib_base,
                                            new_lib_path, target_function, saved_regs);
 
     if (patch_success) {
@@ -1300,19 +1276,10 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         tracked_libraries_[new_lib_path].is_active = true;
         tracked_libraries_[new_lib_path].patched_libraries.push_back(target_info.path);
 
-        // Mark target as original if not already tracked
-        if (tracked_libraries_.find(target_info.path) == tracked_libraries_.end()) {
-            TrackedLibrary target_lib(target_info.path, 0, target_info.base_addr, target_function);
-            target_lib.is_original = true;
-            tracked_libraries_[target_info.path] = target_lib;
-            LOG_INFO("Added original library to tracker: %s", target_info.path.c_str());
-        }
-
         // Clean up unused libraries
-        cleanup_old_libraries(target_info.path, new_lib_path, worker_tid, saved_regs);
+        cleanup_old_libraries(clean_target_path, new_lib_path, worker_tid, saved_regs);
     }
 
-    // Restore registers and detach all threads
     restore_and_detach_all(contexts);
 
     if (patch_success) {
