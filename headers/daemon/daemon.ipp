@@ -1,4 +1,3 @@
-// daemon.cpp
 #include "daemon.hpp"
 #include <iostream>
 #include <fstream>
@@ -14,6 +13,8 @@
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
+
+static Daemon* g_daemon = nullptr;
 
 static std::string get_home_dir() {
     const char* home = getenv("HOME");
@@ -135,16 +136,32 @@ bool Daemon::status() {
     return is_running();
 }
 
+void Daemon::setup_signal_handlers() {
+    struct sigaction sa;
+    sa.sa_handler = [](int) {
+        if (g_daemon) g_daemon->stop();
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+}
+
 void Daemon::stop() {
     running_ = false;
 }
 
 void Daemon::run() {
+    g_daemon = this;
+    setup_signal_handlers();
     running_ = true;
+    
     while (running_) {
         cleanup_dead_processes();
         std::this_thread::sleep_for(interval_);
     }
+    
+    g_daemon = nullptr;
 }
 
 void Daemon::cleanup_dead_processes() {
@@ -166,18 +183,35 @@ void Daemon::cleanup_dead_processes() {
 
         try {
             json j = json::parse(content);
-            if (!j.contains("pid") || !j.contains("starttime")) {
+            if (!j.contains("pid")) {
                 unlink(full_path.c_str());
                 continue;
             }
 
             pid_t pid = j["pid"];
-            unsigned long long saved_start = j["starttime"];
-            unsigned long long now_start = get_process_starttime(pid);
-            if (now_start == 0 || now_start != saved_start) {
+            
+            // First check if process exists
+            if (kill(pid, 0) != 0) {
+                // Process is dead - safe to delete
                 unlink(full_path.c_str());
+                continue;
             }
+            
+            // Process exists - check if it's the same process instance
+            if (j.contains("starttime")) {
+                unsigned long long saved_start = j["starttime"];
+                unsigned long long now_start = get_process_starttime(pid);
+                
+                // Only delete if starttime differs AND we could read it
+                if (now_start != 0 && now_start != saved_start) {
+                    // Different start time - process was reused, original is dead
+                    unlink(full_path.c_str());
+                }
+                // Otherwise keep it - process is alive and is the same instance
+            }
+            // If no starttime in json, keep it - process is alive
         } catch (...) {
+            // Invalid JSON - delete
             unlink(full_path.c_str());
         }
     }

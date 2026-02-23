@@ -15,6 +15,7 @@
 #include <sstream>
 #include <set>
 #include <algorithm>
+#include "daemon.hpp"
 
 // Constants
 static const size_t REMOTE_MEM_SIZE = 4096;
@@ -714,7 +715,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         return false;
     }
     
-    // Останавливаем все потоки
     std::vector<pid_t> tids = get_all_threads(pid_);
     std::vector<ThreadContext> contexts;
     
@@ -722,7 +722,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         return false;
     }
     
-    // Выбираем рабочий поток
     pid_t worker_tid = pid_;
     bool found = false;
     for (const auto& ctx : contexts) {
@@ -736,21 +735,18 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         LOG_INFO("Main thread not found, using thread %d for unload", worker_tid);
     }
     
-    // Подготавливаем поток к инъекции (выходим из системного вызова)
     struct user_regs_struct prepared_regs;
     if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
         restore_and_detach_all(contexts);
         return false;
     }
     
-    // Проверяем, что syscall работает
     if (!test_syscall(worker_tid)) {
         LOG_ERR("Syscall test failed before unload");
         restore_and_detach_all(contexts);
         return false;
     }
     
-    // Выгружаем библиотеку
     LOG_INFO("Calling unload_library_by_handle with handle=0x%lx", lib.handle);
     bool result = unload_library_by_handle(worker_tid, lib.handle, prepared_regs);
     
@@ -762,7 +758,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         LOG_ERR("Failed to unload library %s", lib_path.c_str());
     }
     
-    // Восстанавливаем и открепляем все потоки
     restore_and_detach_all(contexts);
     
     return result;
@@ -1039,8 +1034,7 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
                                         struct user_regs_struct& saved_regs) {
     LOG_DBG("Cleaning up old libraries...");
     
-    // Сначала подготавливаем поток для каждого вызова unload
-    struct user_regs_struct prepared_regs = saved_regs;  // копируем сохранённые регистры
+    struct user_regs_struct prepared_regs = saved_regs; 
     
     std::set<std::string> to_unload;
     for (const auto& pair : tracked_libraries_) {
@@ -1057,7 +1051,6 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
         if (it != tracked_libraries_.end() && it->second.handle != 0) {
             LOG_INFO("Unloading unused library: %s", path.c_str());
             
-            // Подготавливаем поток перед каждым unload
             struct user_regs_struct current_prepared = prepared_regs;
             
             if (unload_library_by_handle(tid, it->second.handle, current_prepared)) {
@@ -1206,17 +1199,19 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         }
         tracked_libraries_[new_lib_path].is_active = true;
         tracked_libraries_[new_lib_path].patched_libraries.push_back(target_info.path);
-
+        
         cleanup_old_libraries(clean_target_path, new_lib_path, worker_tid, saved_regs);
+        
+        // Start cleanup daemon if not running
+        if (!Daemon::is_running()) {
+            Daemon::start();
+        }
+        
+        LOG_RESULT("=== Library replacement completed successfully ===");
+    } else {
+        LOG_RESULT("=== Library replacement failed ===");
     }
 
     restore_and_detach_all(contexts);
-
-    if (patch_success) {
-        LOG_RESULT("=== Library replacement completed successfully ===");
-        return true;
-    } else {
-        LOG_RESULT("=== Library replacement failed ===");
-        return false;
-    }
+    return patch_success;
 }

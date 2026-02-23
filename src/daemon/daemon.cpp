@@ -1,13 +1,6 @@
-// main_daemon.cpp
 #include "daemon.hpp"
 #include <iostream>
 #include <csignal>
-
-static Daemon* g_daemon = nullptr;
-
-void signal_handler(int) {
-    if (g_daemon) g_daemon->stop();
-}
 
 int main(int argc, char** argv) {
     if (argc < 2) {

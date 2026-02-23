@@ -38,30 +38,63 @@ inline void set_syscall_num(user_regs_struct& regs, uintptr_t val) { regs.rax = 
 inline uintptr_t get_syscall_ret(const user_regs_struct& regs) { return regs.rax; }
 inline void set_syscall_ret(user_regs_struct& regs, uintptr_t val) { regs.rax = val; }
 
-// Константы
 constexpr long SYS_MMAP = 9;
 constexpr long SYS_MUNMAP = 11;
 constexpr long SYS_GETPID = 39;
 constexpr int R_JUMP_SLOT = 7;
 
-// Вспомогательные генераторы кода (могут быть inline)
 inline std::vector<uint8_t> breakpoint_instruction() { return {0xCC}; }
 
 inline std::vector<uint8_t> generate_dlopen_shellcode(uintptr_t path_addr, uintptr_t dlopen_addr, uintptr_t result_addr) {
     std::vector<uint8_t> shellcode = {
-        0x55, 0x48, 0x89, 0xe5, 0x57, 0x56, 0x50, 0x48, 0x83, 0xec, 0x08,
-        0x48, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0xc7, 0xc6, 0x02, 0x00, 0x00, 0x00,
-        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0xff, 0xd0,
-        0x48, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x89, 0x07,
-        0x48, 0x83, 0xc4, 0x08, 0x58, 0x5e, 0x5f, 0x5d, 0xcc, 0xc3
+        // Prologue: save registers and set up stack frame
+        0x55,                               // push rbp
+        0x48, 0x89, 0xe5,                   // mov rbp, rsp
+        0x57,                               // push rdi
+        0x56,                               // push rsi
+        0x50,                               // push rax
+        0x48, 0x83, 0xec, 0x08,             // sub rsp, 8
+        
+        // First argument for dlopen: path_addr -> rdi
+        0x48, 0xbf,                         // mov rdi, imm64
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // placeholder for path_addr
+        
+        // Second argument for dlopen: flags (RTLD_NOW = 2) -> rsi
+        0x48, 0xc7, 0xc6, 0x02, 0x00, 0x00, 0x00, // mov rsi, 2
+        
+        // Load dlopen address into rax
+        0x48, 0xb8,                         // mov rax, imm64
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // placeholder for dlopen_addr
+        
+        // Call dlopen
+        0xff, 0xd0,                         // call rax
+        
+        // Save result (handle) to result_addr
+        0x48, 0xbf,                         // mov rdi, imm64
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // placeholder for result_addr
+        0x48, 0x89, 0x07,                   // mov [rdi], rax
+        
+        // Epilogue: restore stack and registers
+        0x48, 0x83, 0xc4, 0x08,             // add rsp, 8
+        0x58,                               // pop rax
+        0x5e,                               // pop rsi
+        0x5f,                               // pop rdi
+        0x5d,                               // pop rbp
+        
+        // Trap to debugger and return
+        0xcc,                               // int3
+        0xc3                                // ret
     };
-    const size_t PATH_OFFSET = 13, DLOPEN_OFFSET = 30, RESULT_OFFSET = 42;
+    
+    // Patch placeholders with actual addresses
+    const size_t PATH_OFFSET = 13;          // offset of path_addr placeholder
+    const size_t DLOPEN_OFFSET = 30;        // offset of dlopen_addr placeholder
+    const size_t RESULT_OFFSET = 42;        // offset of result_addr placeholder
+    
     *reinterpret_cast<uintptr_t*>(&shellcode[PATH_OFFSET]) = path_addr;
     *reinterpret_cast<uintptr_t*>(&shellcode[DLOPEN_OFFSET]) = dlopen_addr;
     *reinterpret_cast<uintptr_t*>(&shellcode[RESULT_OFFSET]) = result_addr;
+    
     return shellcode;
 }
 

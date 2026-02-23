@@ -1,4 +1,3 @@
-// daemon.hpp
 #ifndef DAEMON_HPP
 #define DAEMON_HPP
 
@@ -36,6 +35,7 @@ private:
     std::string get_pid_file() const;
     bool write_pid_file() const;
     void remove_pid_file() const;
+    void setup_signal_handlers();
 
     std::atomic<bool> running_;
     std::chrono::seconds interval_;
