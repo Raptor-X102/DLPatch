@@ -1,5 +1,4 @@
-// Updated DL_manager_replace.ipp with architecture abstraction
-
+// DL_manager_replace.ipp
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/user.h>
@@ -97,23 +96,31 @@ static std::vector<pid_t> get_all_threads(pid_t pid) {
 }
 
 static bool write_remote_memory(pid_t pid, uintptr_t addr, const void* data, size_t size) {
+    // Cast data to byte array for easy manipulation
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    uintptr_t start_word = addr & ~(sizeof(long) - 1);
-    uintptr_t end_word = (addr + size + sizeof(long) - 1) & ~(sizeof(long) - 1);
+    
+    // Calculate word-aligned range that covers our memory region
+    // ptrace POKEDATA works with whole words (8 bytes), so we need to handle partial words
+    uintptr_t start_word = addr & ~(sizeof(long) - 1);  // First word boundary
+    uintptr_t end_word = (addr + size + sizeof(long) - 1) & ~(sizeof(long) - 1);  // Last word boundary
     
     LOG_DBG("Writing %zu bytes to 0x%lx, word range 0x%lx-0x%lx", 
             size, addr, start_word, end_word);
 
+    // Iterate over each affected word
     for (uintptr_t w = start_word; w < end_word; w += sizeof(long)) {
         long word = 0;
         bool need_read = false;
         
+        // Check if this word is partially outside our target range
+        // If word starts before addr OR ends after addr+size, we need to preserve existing data
         if (w < addr || w + sizeof(long) > addr + size) {
             need_read = true;
         }
         
         if (need_read) {
             errno = 0;
+            // Read the current word value from remote process
             word = ptrace(PTRACE_PEEKDATA, pid, w, nullptr);
             if (word == -1 && errno != 0) {
                 LOG_ERR("ptrace PEEKDATA failed at 0x%lx: %s", w, strerror(errno));
@@ -122,25 +129,39 @@ static bool write_remote_memory(pid_t pid, uintptr_t addr, const void* data, siz
             LOG_DBG("Read word at 0x%lx: 0x%016lx", w, word);
         }
         
+        // Calculate offsets for merging new data into the word
+        // src_offset: where in 'bytes' to start copying
+        // dst_offset: where in the word to place the data
+        // copy_len: how many bytes to copy
+        
         size_t src_offset = (w > addr) ? 0 : (addr - w);
+        // If word starts before addr, skip bytes before addr
+        // Example: addr=0x1003, w=0x1000 → src_offset = 3
+        
         size_t dst_offset = (w < addr) ? (addr - w) : 0;
+        // If word starts before addr, we start writing at offset (addr-w) in the word
+        
         size_t copy_len = std::min(sizeof(long) - dst_offset, 
                                    size - (w - addr + dst_offset));
+        // Copy until we hit word boundary or run out of data
         
         LOG_DBG("Word 0x%lx: dst_offset=%zu, src_offset=%zu, copy_len=%zu", 
                 w, dst_offset, src_offset, copy_len);
         
+        // Merge new bytes into the word
         memcpy(reinterpret_cast<uint8_t*>(&word) + dst_offset, 
                bytes + src_offset + (w - addr), copy_len);
         
         LOG_DBG("Writing word at 0x%lx: 0x%016lx", w, word);
         
+        // Write the modified word back to remote process
         if (ptrace(PTRACE_POKEDATA, pid, w, word) == -1) {
             LOG_ERR("ptrace POKEDATA failed at 0x%lx: %s", w, strerror(errno));
             return false;
         }
         
 #ifdef DEBUG
+        // Verification step - read back and compare
         long verify = ptrace(PTRACE_PEEKDATA, pid, w, nullptr);
         if (verify == -1 && errno != 0) {
             LOG_ERR("Verification read failed at 0x%lx", w);
@@ -159,9 +180,16 @@ static bool write_remote_memory(pid_t pid, uintptr_t addr, const void* data, siz
 }
 
 static bool read_remote_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
-    struct iovec local = {buffer, size};
-    struct iovec remote = {reinterpret_cast<void*>(addr), size};
+    // iovec structures for scatter-gather I/O
+    struct iovec local = {buffer, size};     // Local buffer to read into
+    struct iovec remote = {reinterpret_cast<void*>(addr), size};  // Remote memory region
+    
+    // process_vm_readv - Linux syscall for efficient cross-process memory reading
+    // It reads 'size' bytes from remote process at 'addr' directly into local buffer
+    // Parameters: pid, local iovec array (1 element), remote iovec array (1 element), flags=0
     ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    
+    // Return true only if we read exactly the requested number of bytes
     return n == static_cast<ssize_t>(size);
 }
 
@@ -172,15 +200,33 @@ bool DL_Manager::read_remote_memory_raw(uintptr_t addr, void* buffer, size_t siz
 static uintptr_t remote_mmap(pid_t pid, size_t length, int prot, int flags, int fd, off_t offset,
                              uintptr_t syscall_insn_addr) {
     uintptr_t result;
-    if (!Arch::remote_syscall(pid, result, Arch::SYS_MMAP, 0, length, prot, flags, fd, offset, syscall_insn_addr))
+    if (!Arch::remote_syscall(pid, result, Arch::SYS_MMAP, 
+    0,        // arg1 (rdi): addr - 0 = let kernel choose
+    length,   // arg2 (rsi): size
+    prot,     // arg3 (rdx): protection flags
+    flags,    // arg4 (r10): mapping flags
+    fd,       // arg5 (r8):  file descriptor
+    offset,   // arg6 (r9):  file offset
+    syscall_insn_addr)) {
         return 0;
+    }
+
     return result;
 }
 
 static bool remote_munmap(pid_t pid, uintptr_t addr, size_t length, uintptr_t syscall_insn_addr) {
     uintptr_t result;
-    if (!Arch::remote_syscall(pid, result, Arch::SYS_MUNMAP, addr, length, 0, 0, 0, 0, syscall_insn_addr))
+    if (!Arch::remote_syscall(pid, result, Arch::SYS_MUNMAP,
+        addr,     // arg1 (rdi): address to unmap
+        length,   // arg2 (rsi): size to unmap
+        0,        // arg3 (rdx): unused
+        0,        // arg4 (r10): unused
+        0,        // arg5 (r8):  unused
+        0,        // arg6 (r9):  unused
+        syscall_insn_addr)) {
         return false;
+    }
+
     return result == 0;
 }
 
@@ -191,7 +237,7 @@ static bool remote_munmap(pid_t pid, uintptr_t addr, size_t length, uintptr_t sy
 void DL_Manager::init_addresses() {
     LibraryInfo libc_info = get_library_info("libc.so");
     if (libc_info.base_addr == 0) {
-        LOG_WARN("libc not found, some features may not work");
+        LOG_ERR("Failed to find libc.so in target process - required for dlopen/dlclose");
         return;
     }
     
@@ -199,15 +245,25 @@ void DL_Manager::init_addresses() {
     dlclose_addr_ = get_symbol_address(libc_info.base_addr, "dlclose");
     syscall_insn_ = find_syscall_instruction(libc_info.base_addr);
     
-    LOG_INFO("Initialized addresses: dlopen=0x%lx, dlclose=0x%lx, syscall=0x%lx",
-             dlopen_addr_, dlclose_addr_, syscall_insn_);
+    if (dlopen_addr_ == 0 || dlclose_addr_ == 0 || syscall_insn_ == 0) {
+        LOG_ERR("Failed to locate required symbols in libc");
+        return;
+    }
+    
+    LOG_DBG("Initialized addresses: dlopen=0x%lx, dlclose=0x%lx, syscall=0x%lx",
+            dlopen_addr_, dlclose_addr_, syscall_insn_);
 }
 
 uintptr_t DL_Manager::find_syscall_instruction(uintptr_t libc_base) {
     return Arch::find_syscall_instruction(this, libc_base);
 }
 
+// Check if library is already loaded in target process
+// Returns:
+// - true with base_addr/handle filled if found in tracker or /proc/pid/maps
+// - false if not found (library needs to be loaded)
 bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_t& base_addr, uintptr_t& handle) {
+    // First check our tracker (libraries we loaded ourselves)
     auto it = tracked_libraries_.find(lib_path);
     if (it != tracked_libraries_.end()) {
         base_addr = it->second.base_addr;
@@ -215,22 +271,29 @@ bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_
         return true;
     }
     
+    // If not in tracker, check /proc/pid/maps to see if process already has it
     std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
     std::ifstream maps_file(maps_path);
-    if (!maps_file.is_open()) return false;
+    if (!maps_file.is_open()) {
+        // Can't open maps - process probably died, but that's not our problem here
+        // Just return false and let caller handle it
+        return false;
+    }
     
+    // Parse maps file line by line
     std::string line;
     while (std::getline(maps_file, line)) {
         if (line.find(lib_path) != std::string::npos) {
             size_t dash = line.find('-');
             if (dash != std::string::npos) {
+                // Extract base address (hex number before '-')
                 base_addr = std::stoul(line.substr(0, dash), nullptr, 16);
-                handle = 0;
+                handle = 0; // No handle for libraries we didn't load
                 return true;
             }
         }
     }
-    return false;
+    return false; // Not found anywhere
 }
 
 bool DL_Manager::is_library_active(const std::string& lib_path) const {
@@ -243,9 +306,22 @@ bool DL_Manager::is_library_active(const std::string& lib_path) const {
 
 bool DL_Manager::test_syscall(pid_t tid) {
     if (syscall_insn_ == 0) return false;
+    
     uintptr_t result;
+    // Arch::remote_syscall parameters:
+    // 1. tid               - thread to execute syscall in
+    // 2. result (output)   - will contain syscall return value
+    // 3. Arch::SYS_GETPID  - syscall number (39 on x86_64)
+    // 4. arg1 (0)          - SYS_GETPID has no arguments, so all are 0
+    // 5. arg2 (0)          
+    // 6. arg3 (0)          
+    // 7. arg4 (0)          
+    // 8. arg5 (0)          
+    // 9. arg6 (0)          
+    // 10. syscall_insn_    - address of "syscall" instruction in remote process
     if (!Arch::remote_syscall(tid, result, Arch::SYS_GETPID, 0, 0, 0, 0, 0, 0, syscall_insn_))
         return false;
+    
     return true;
 }
 
@@ -277,6 +353,14 @@ std::vector<pid_t> DL_Manager::stop_threads_and_prepare_main(pid_t& main_tid,
         return {};
     }
     
+    // Execute two PTRACE_SYSCALL steps to ensure thread is out of any syscall
+    // Reason: If thread is inside a syscall when we try to execute shellcode,
+    // the kernel will restart the syscall after we detach, corrupting program state
+    // First PTRACE_SYSCALL: 
+    //   - If thread was in syscall, it will exit it and stop on syscall exit
+    //   - If thread was not in syscall, it will enter next syscall and stop on entry
+    // Second PTRACE_SYSCALL:
+    //   - Ensures thread is stopped at a safe point (not inside any syscall)
     for (int i = 0; i < 2; ++i) {
         if (ptrace(PTRACE_SYSCALL, main_tid, nullptr, nullptr) == -1) {
             LOG_ERR("ptrace SYSCALL failed");
@@ -312,12 +396,12 @@ uintptr_t DL_Manager::allocate_remote_memory(pid_t tid, size_t size) {
                        syscall_insn_);
 }
 
-bool DL_Manager::write_shellcode_with_verification(pid_t tid, uintptr_t shellcode_addr,
+bool DL_Manager::write_shellcode(pid_t tid, uintptr_t shellcode_addr,
                                                    uintptr_t path_addr, uintptr_t result_addr) {
     auto shellcode = Arch::generate_dlopen_shellcode(path_addr, dlopen_addr_, result_addr);
     
+    // Debug: dump shellcode bytes before writing
     LOG_DBG("Shellcode size: %zu bytes", shellcode.size());
-    
     LOG_DBG("Shellcode before writing:");
     for (size_t i = 0; i < shellcode.size(); i += 8) {
         size_t chunk = std::min(shellcode.size() - i, size_t(8));
@@ -326,6 +410,9 @@ bool DL_Manager::write_shellcode_with_verification(pid_t tid, uintptr_t shellcod
         LOG_DBG("  offset %3zu: 0x%016lx", i, val);
     }
     
+#ifdef DEBUG
+    // In debug builds, verify that result_addr is writable
+    // by writing a test pattern and reading it back
     LOG_DBG("Testing writability of result_addr 0x%lx", result_addr);
     uint64_t test_val = 0xDEADBEEFDEADBEEF;
     if (!write_remote_memory(tid, result_addr, &test_val, sizeof(test_val))) {
@@ -338,42 +425,58 @@ bool DL_Manager::write_shellcode_with_verification(pid_t tid, uintptr_t shellcod
         LOG_ERR("result_addr verification failed!");
         return false;
     }
-
+    // Clear test pattern
     test_val = 0;
     write_remote_memory(tid, result_addr, &test_val, sizeof(test_val));
     LOG_DBG("result_addr is writable");
+#else
+    // Release builds: skip verification, assume it's writable
+    // (we allocated it with PROT_WRITE via remote_mmap)
+    (void)result_addr; // Suppress unused parameter warning
+#endif
     
+    // Write the actual shellcode
     if (!write_remote_memory(tid, shellcode_addr, shellcode.data(), shellcode.size()))
         return false;
     
+#ifdef DEBUG
+    // Verify shellcode was written correctly by reading it back
     std::vector<uint8_t> verify(shellcode.size());
     if (!read_remote_memory(tid, shellcode_addr, verify.data(), verify.size()))
         return false;
     if (memcmp(verify.data(), shellcode.data(), shellcode.size()) != 0)
         return false;
-    
     LOG_DBG("Shellcode written and verified successfully");
+#else
+    // Release builds: trust that write succeeded
+    LOG_DBG("Shellcode written successfully");
+#endif
+    
     return true;
 }
 
 bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode_addr,
                                                    struct user_regs_struct& saved_regs,
                                                    uintptr_t& out_handle) {
+    // Create new register state with IP pointing to shellcode
     struct user_regs_struct new_regs = saved_regs;
     Arch::set_ip(new_regs, shellcode_addr);
     
     LOG_DBG("Setting IP to 0x%lx, original SP=0x%lx", shellcode_addr, Arch::get_sp(saved_regs));
     
+    // Apply new register state to remote thread
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &new_regs) == -1) {
         LOG_ERR("ptrace SETREGS failed: %s", strerror(errno));
         return false;
     }
     
+    // Let the thread execute the shellcode
     if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) == -1) {
         LOG_ERR("ptrace CONT failed: %s", strerror(errno));
         return false;
     }
     
+    // Wait for shellcode to hit int3 and stop
     int status;
     waitpid(tid, &status, 0);
     
@@ -382,15 +485,17 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
     
     if (WIFSTOPPED(status)) {
         int sig = WSTOPSIG(status);
-        LOG_INFO("Thread stopped with signal %d", sig);
+        LOG_DBG("Thread stopped with signal %d", sig);
         
         if (sig == SIGTRAP) {
-            LOG_INFO("Got SIGTRAP as expected");
+            // Shellcode completed successfully, read the handle
+            LOG_DBG("Got SIGTRAP, reading dlopen result");
             if (read_remote_memory(tid, result_addr, &handle, sizeof(handle))) {
-                LOG_INFO("Handle from result_addr: 0x%lx", handle);
+                LOG_DBG("dlopen returned handle 0x%lx", handle);
                 if (handle != 0) {
                     out_handle = handle;
                     
+                    // Restore original registers
                     if (ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs) == -1) {
                         LOG_ERR("Failed to restore registers after shellcode: %s", strerror(errno));
                     }
@@ -403,34 +508,16 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
                 LOG_ERR("Failed to read handle from result_addr");
             }
         } else if (sig == SIGSEGV) {
+            // Shellcode crashed - dump debug info
             LOG_ERR("Segmentation fault in shellcode");
             
             siginfo_t siginfo;
             if (ptrace(PTRACE_GETSIGINFO, tid, nullptr, &siginfo) == 0) {
                 LOG_ERR("Fault address: 0x%lx, code: %d", 
                         (uintptr_t)siginfo.si_addr, siginfo.si_code);
-                
-                struct user_regs_struct fault_regs;
-                if (ptrace(PTRACE_GETREGS, tid, nullptr, &fault_regs) == 0) {
-                    LOG_ERR("Fault registers:");
-                    LOG_ERR("  IP=0x%llx", (unsigned long long)Arch::get_ip(fault_regs));
-                    LOG_ERR("  SP=0x%llx", (unsigned long long)Arch::get_sp(fault_regs));
-                    LOG_ERR("  RAX=0x%llx", (unsigned long long)fault_regs.rax);
-                    LOG_ERR("  RDI=0x%llx", (unsigned long long)fault_regs.rdi);
-                    LOG_ERR("  RSI=0x%llx", (unsigned long long)fault_regs.rsi);
-                    
-                    unsigned char code_dump[32];
-                    uintptr_t dump_addr = Arch::get_ip(fault_regs) & ~0xf;
-                    if (read_remote_memory(tid, dump_addr, code_dump, sizeof(code_dump))) {
-                        LOG_ERR("Code around fault address:");
-                        for (int i = 0; i < 32; i += 8) {
-                            uint64_t val;
-                            memcpy(&val, code_dump + i, 8);
-                            LOG_ERR("  0x%lx: 0x%016lx", dump_addr + i, val);
-                        }
-                    }
-                }
             }
+            
+            Arch::dump_registers(tid, this);
         } else {
             LOG_ERR("Unexpected signal %d after shellcode", sig);
         }
@@ -442,6 +529,7 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
         LOG_ERR("Unexpected wait status %d", status);
     }
     
+    // Restore original registers on any failure
     LOG_INFO("Restoring original registers after error");
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs) == -1) {
         LOG_ERR("Failed to restore registers after shellcode: %s", strerror(errno));
@@ -510,46 +598,46 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
         return 0;
     }
 
-    LOG_INFO("load_new_library: tid=%d, lib_path=%s", tid, lib_path.c_str());
-    LOG_INFO("dlopen_addr=0x%lx, syscall_insn=0x%lx", dlopen_addr_, syscall_insn_);
+    LOG_INFO("Loading new library: tid=%d, lib_path=%s", tid, lib_path.c_str());
+    LOG_DBG("dlopen_addr=0x%lx, syscall_insn=0x%lx", dlopen_addr_, syscall_insn_);
 
     uintptr_t test_result;
     if (!Arch::remote_syscall(tid, test_result, Arch::SYS_GETPID, 0, 0, 0, 0, 0, 0, syscall_insn_)) {
         LOG_ERR("remote_syscall test failed before allocation");
         return 0;
     }
-    LOG_INFO("remote_syscall test passed, result=%lu", test_result);
+    LOG_DBG("remote_syscall test passed, result=%lu", test_result);
 
     uintptr_t remote_mem = allocate_remote_memory(tid, REMOTE_MEM_SIZE);
     if (remote_mem == 0) {
         LOG_ERR("allocate_remote_memory failed");
         return 0;
     }
-    LOG_INFO("remote_mem allocated at 0x%lx", remote_mem);
+    LOG_INFO("Remote memory allocated at 0x%lx", remote_mem);
 
     uintptr_t path_addr = remote_mem + SHELLCODE_PATH_OFFSET;
     uintptr_t result_addr = remote_mem + SHELLCODE_RESULT_OFFSET;
     
-    LOG_INFO("path_addr = 0x%lx, result_addr = 0x%lx", path_addr, result_addr);
+    LOG_DBG("path_addr = 0x%lx, result_addr = 0x%lx", path_addr, result_addr);
 
     if (!write_remote_memory(tid, path_addr, lib_path.c_str(), lib_path.size() + 1)) {
         LOG_ERR("Failed to write library path");
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
         return 0;
     }
-    LOG_INFO("Library path written to 0x%lx", path_addr);
+    LOG_INFO("Library path written to remote memory");
 
     char path_check[256] = {0};
     if (read_remote_memory(tid, path_addr, path_check, lib_path.size() + 1)) {
-        LOG_INFO("Path verification: %s", path_check);
+        LOG_DBG("Path verification: %s", path_check);
     }
 
-    if (!write_shellcode_with_verification(tid, remote_mem, path_addr, result_addr)) {
+    if (!write_shellcode(tid, remote_mem, path_addr, result_addr)) {
         LOG_ERR("Failed to write shellcode");
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
         return 0;
     }
-    LOG_INFO("Shellcode written to 0x%lx", remote_mem);
+    LOG_INFO("Shellcode written to remote memory");
 
     if (!execute_shellcode_and_get_handle(tid, remote_mem, saved_regs, out_handle)) {
         LOG_ERR("execute_shellcode_and_get_handle failed");
@@ -595,9 +683,9 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
     uintptr_t result_addr = remote_mem + 256;
     
     LOG_INFO("Unloading library with handle = 0x%lx", handle);
-    LOG_INFO("Shellcode at: 0x%lx", remote_mem);
-    LOG_INFO("Result addr: 0x%lx", result_addr);
-    LOG_INFO("dlclose addr: 0x%lx", dlclose_addr_);
+    LOG_DBG("Shellcode at: 0x%lx", remote_mem);
+    LOG_DBG("Result addr: 0x%lx", result_addr);
+    LOG_DBG("dlclose addr: 0x%lx", dlclose_addr_);
     
     auto shellcode = Arch::generate_dlclose_shellcode(handle, dlclose_addr_, result_addr);
     
@@ -641,7 +729,7 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
     
     if (WIFSTOPPED(status)) {
         int sig = WSTOPSIG(status);
-        LOG_INFO("Thread stopped with signal %d", sig);
+        LOG_DBG("Thread stopped with signal %d", sig);
         
         if (sig == SIGTRAP) {
             // Read result
@@ -1171,7 +1259,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-    LOG_INFO("Prepared IP=0x%llx, SP=0x%llx", 
+    LOG_DBG("Prepared IP=0x%llx, SP=0x%llx", 
              (unsigned long long)Arch::get_ip(prepared_regs), 
              (unsigned long long)Arch::get_sp(prepared_regs));
 

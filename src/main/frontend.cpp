@@ -11,30 +11,33 @@
 static void check_ptrace_capability() {
     cap_t caps = cap_get_proc();
     if (!caps) {
-        std::cerr << "Warning: Could not check capabilities: " << strerror(errno) << std::endl;
+        std::cerr << "Warning: Could not check capabilities: " << strerror(errno)
+                  << std::endl;
         return;
     }
-    
+
     cap_flag_value_t cap_sys_ptrace;
     if (cap_get_flag(caps, CAP_SYS_PTRACE, CAP_EFFECTIVE, &cap_sys_ptrace) != 0) {
-        std::cerr << "Warning: Could not get CAP_SYS_PTRACE flag: " << strerror(errno) << std::endl;
+        std::cerr << "Warning: Could not get CAP_SYS_PTRACE flag: " << strerror(errno)
+                  << std::endl;
         cap_free(caps);
         return;
     }
-    
+
     if (!cap_sys_ptrace) {
-        std::cerr << "\n[NOTE] The program lacks CAP_SYS_PTRACE capability.\n"
-                  << "       To replace libraries in processes not started by this tool,\n"
-                  << "       you need to add this capability:\n"
-                  << "         sudo setcap cap_sys_ptrace=eip ./build/dl_manager\n"
-                  << "         sudo setcap cap_sys_ptrace=eip ./build/dl_manager_daemon\n"
-                  << "       Or run with sudo (not recommended).\n\n";
+        std::cerr
+            << "\n[NOTE] The program lacks CAP_SYS_PTRACE capability.\n"
+            << "       To replace libraries in processes not started by this tool,\n"
+            << "       you need to add this capability:\n"
+            << "         sudo setcap cap_sys_ptrace=eip ./build/dl_manager\n"
+            << "         sudo setcap cap_sys_ptrace=eip ./build/dl_manager_daemon\n"
+            << "       Or run with sudo (not recommended).\n\n";
     }
-    
+
     cap_free(caps);
 }
 
-static void print_usage(const char* prog) {
+static void print_usage(const char *prog) {
     std::cerr << "Usage:\n"
               << "  " << prog << " list <pid>\n"
               << "  " << prog << " symbols <pid> <library_pattern>\n"
@@ -44,7 +47,7 @@ static void print_usage(const char* prog) {
               << "  " << prog << " status <pid>\n";
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     if (argc < 3) {
         print_usage(argv[0]);
         return 1;
