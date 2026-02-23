@@ -89,6 +89,14 @@ public:
         init_addresses();
     }
 
+    void set_tracked_libraries(const std::map<std::string, TrackedLibrary>& libs) { 
+        tracked_libraries_ = libs; 
+    }
+    
+    const std::map<std::string, TrackedLibrary>& get_tracked_libraries() const { 
+        return tracked_libraries_; 
+    }
+
     //-------------------------------------------------------------------------
     // Library information methods (DL_Manager_get_lib_data.ipp)
     //-------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+// headers/backend/logging.hpp
 #ifndef LOGGING_HPP
 #define LOGGING_HPP
 
@@ -11,6 +12,10 @@
 // Always print warnings to stderr
 #define LOG_WARN(fmt, ...) \
     fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
+
+// Always print results (success/failure) to stdout
+#define LOG_RESULT(fmt, ...) \
+    printf("[RESULT] " fmt "\n", ##__VA_ARGS__)
 
 // Info messages – shown unless NDEBUG is defined
 #ifndef NDEBUG

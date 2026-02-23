@@ -538,7 +538,7 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    size_t mem_size = 256;
+    size_t mem_size = 4096;
     uintptr_t remote_mem = remote_mmap(tid, mem_size,
                                        PROT_READ | PROT_WRITE | PROT_EXEC,
                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0,
@@ -548,56 +548,82 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    auto shellcode = Arch::generate_dlclose_shellcode(handle, dlclose_addr_);
+    uintptr_t result_addr = remote_mem + 256;
     
-    LOG_DBG("Unload shellcode size: %zu bytes", shellcode.size());
+    LOG_INFO("Unloading library with handle = 0x%lx", handle);
+    LOG_INFO("Shellcode at: 0x%lx", remote_mem);
+    LOG_INFO("Result addr: 0x%lx", result_addr);
+    LOG_INFO("dlclose addr: 0x%lx", dlclose_addr_);
     
+    auto shellcode = Arch::generate_dlclose_shellcode(handle, dlclose_addr_, result_addr);
+    
+    // Clear result area
+    uint64_t zero = 0;
+    if (!write_remote_memory(tid, result_addr, &zero, sizeof(zero))) {
+        LOG_ERR("Failed to clear result area");
+        remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
+        return false;
+    }
+    
+    // Write shellcode
     if (!write_remote_memory(tid, remote_mem, shellcode.data(), shellcode.size())) {
         LOG_ERR("Failed to write unload shellcode");
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
+    // Set IP to shellcode
     struct user_regs_struct new_regs = saved_regs;
     Arch::set_ip(new_regs, remote_mem);
     
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &new_regs) == -1) {
-        LOG_ERR("ptrace SETREGS for unload failed");
+        LOG_ERR("ptrace SETREGS failed: %s", strerror(errno));
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
+    // Execute
     if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) == -1) {
-        LOG_ERR("ptrace CONT for unload failed");
+        LOG_ERR("ptrace CONT failed: %s", strerror(errno));
+        remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
+        return false;
     }
     
     int status;
     waitpid(tid, &status, 0);
     
     bool success = false;
+    uint64_t dlclose_result = 0;
     
     if (WIFSTOPPED(status)) {
         int sig = WSTOPSIG(status);
-        LOG_DBG("Unload thread stopped with signal %d", sig);
+        LOG_INFO("Thread stopped with signal %d", sig);
         
         if (sig == SIGTRAP) {
-            LOG_DBG("dlclose completed successfully (SIGTRAP)");
-            success = true;
+            // Read result
+            if (read_remote_memory(tid, result_addr, &dlclose_result, sizeof(dlclose_result))) {
+                LOG_INFO("dlclose returned %lu", dlclose_result);
+                success = (dlclose_result == 0);
+            } else {
+                LOG_ERR("Failed to read dlclose result");
+            }
         } else {
-            LOG_WARN("Unload thread stopped with signal %d, assuming success", sig);
-            success = true;
+            LOG_ERR("Unexpected signal %d during unload", sig);
+            Arch::dump_registers(tid, this);
         }
-    } else if (WIFEXITED(status)) {
-        LOG_ERR("Thread exited during unload with status %d", WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-        LOG_ERR("Thread terminated with signal %d during unload", WTERMSIG(status));
+    } else {
+        LOG_ERR("Unexpected wait status: %d", status);
     }
     
-    if (ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs) == -1) {
-        LOG_ERR("Failed to restore registers after unload");
-    }
+    // Restore registers
+    ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs);
     
+    // Free memory
     remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
+    
+    if (success) {
+        LOG_INFO("Successfully unloaded library with handle 0x%lx", handle);
+    }
     
     return success;
 }
@@ -611,10 +637,16 @@ void DL_Manager::print_library_tracker() const {
         LOG_INFO("  Path: %s", lib.path.c_str());
         LOG_INFO("    Handle   : 0x%lx", lib.handle);
         LOG_INFO("    Base     : 0x%lx", lib.base_addr);
-        LOG_INFO("    Functions: %s", lib.provided_functions.empty() ? "(none)" : "");
-        for (const auto& f : lib.provided_functions) {
-            LOG_INFO("      - %s", f.c_str());
+        
+        if (!lib.provided_functions.empty()) {
+            LOG_INFO("    Functions:");
+            for (const auto& f : lib.provided_functions) {
+                LOG_INFO("      - %s", f.c_str()); 
+            }
+        } else {
+            LOG_INFO("    Functions: (none)");
         }
+        
         LOG_INFO("    Active   : %s", lib.is_active ? "yes" : "no");
         LOG_INFO("    Original : %s", lib.is_original ? "yes" : "no");
         LOG_INFO("    Patched libs: %zu", lib.patched_libraries.size());
@@ -739,7 +771,11 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
                                      const std::string& target_function,
                                      struct user_regs_struct& saved_regs) {
     std::string clean_target_path = trim(target_lib_path);
-    bool all_success = true;
+    bool any_success = false;
+    int total = 0;
+    int succeeded = 0;
+    int skipped = 0;
+    int failed = 0;
     
     if (target_function == "all") {
         auto old_symbols = get_function_symbols(old_base);
@@ -748,11 +784,21 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
         std::vector<std::string> patched_functions;
         
         for (const auto& sym : old_symbols) {
+            total++;
             const std::string& func_name = sym.name;
+            
+            // Skip internal C++ symbols (mangled names starting with _Z)
+            if (func_name.size() > 2 && func_name.substr(0, 2) == "_Z") {
+                LOG_DBG("Skipping internal C++ symbol: %s", func_name.c_str());
+                skipped++;
+                continue;
+            }
+            
             uintptr_t old_func_addr = sym.addr;
             uintptr_t new_func_addr = get_symbol_address(new_base, func_name);
             if (new_func_addr == 0) {
-                LOG_WARN("Function '%s' not found in new library, skipping", func_name.c_str());
+                LOG_DBG("Function '%s' not found in new library, skipping", func_name.c_str());
+                skipped++;
                 continue;
             }
             
@@ -761,18 +807,26 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
                         func_name.c_str(), old_func_addr, new_func_addr, sym.size);
                 if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
                     patched_functions.push_back(func_name);
+                    succeeded++;
+                    any_success = true;
                 } else {
-                    LOG_ERR("Failed to patch %s", func_name.c_str());
-                    all_success = false;
+                    LOG_WARN("Failed to patch %s", func_name.c_str());
+                    failed++;
                 }
             } else {
                 LOG_DBG("Function %s already at same address, skipping", func_name.c_str());
+                skipped++;
             }
         }
+        
+        LOG_RESULT("Patching summary: total=%d, succeeded=%d, skipped=%d, failed=%d", 
+                   total, succeeded, skipped, failed);
         
         if (!patched_functions.empty()) {
             tracked_libraries_[new_lib_path].provided_functions = patched_functions;
         }
+        
+        return any_success;
     } else {
         uintptr_t old_func = get_symbol_address(old_base, target_function);
         uintptr_t new_func = get_symbol_address(new_base, target_function);
@@ -791,17 +845,17 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
         LOG_DBG("Target function at 0x%lx, new at 0x%lx, size=%zu", old_func, new_func, old_size);
         
         if (old_func != new_func) {
-            all_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function, saved_regs);
-            if (all_success) {
+            any_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function, saved_regs);
+            if (any_success) {
                 tracked_libraries_[new_lib_path].provided_functions.push_back(target_function);
             }
         } else {
             LOG_INFO("Function addresses are identical, no patch needed.");
-            all_success = true;
+            any_success = true;
         }
+        
+        return any_success;
     }
-    
-    return all_success;
 }
 
 bool DL_Manager::check_preconditions(const std::string& target_lib_pattern) {
@@ -948,19 +1002,21 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
 bool DL_Manager::replace_library(const std::string& target_lib_pattern,
                                   const std::string& new_lib_path,
                                   const std::string& target_function) {
-    LOG_INFO("=== Starting library replacement ===");
-    LOG_INFO("Target pattern: %s", target_lib_pattern.c_str());
-    LOG_INFO("New: %s", new_lib_path.c_str());
-    LOG_INFO("Function: %s", target_function.c_str());
+    LOG_RESULT("=== Starting library replacement ===");
+    LOG_RESULT("Target pattern: %s", target_lib_pattern.c_str());
+    LOG_RESULT("New: %s", new_lib_path.c_str());
+    LOG_RESULT("Function: %s", target_function.c_str());
 
     if (dlopen_addr_ == 0 || dlclose_addr_ == 0 || syscall_insn_ == 0) {
         LOG_ERR("Required addresses not initialized");
+        LOG_RESULT("=== Library replacement failed ===");
         return false;
     }
 
     LibraryInfo target_info = get_library_info(target_lib_pattern);
     if (target_info.base_addr == 0) {
         LOG_ERR("Target library not found");
+        LOG_RESULT("=== Library replacement failed ===");
         return false;
     }
 
@@ -975,6 +1031,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
 
     if (new_lib_path == target_info.path) {
         LOG_INFO("New library is the same as target, nothing to do.");
+        LOG_RESULT("=== Library replacement skipped (same library) ===");
         return true;
     }
 
@@ -1083,10 +1140,10 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     restore_and_detach_all(contexts);
 
     if (patch_success) {
-        LOG_INFO("=== Library replacement completed successfully ===");
+        LOG_RESULT("=== Library replacement completed successfully ===");
         return true;
     } else {
-        LOG_ERR("=== Library replacement failed ===");
+        LOG_RESULT("=== Library replacement failed ===");
         return false;
     }
 }

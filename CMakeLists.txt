@@ -1,3 +1,4 @@
+# Корневой CMakeLists.txt
 cmake_minimum_required(VERSION 3.10)
 project(LivePatching LANGUAGES CXX)
 
@@ -5,71 +6,88 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 
-# Пути к библиотекам
-set(LIB_TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
+# Поиск библиотеки nlohmann_json
+find_package(nlohmann_json CONFIG REQUIRED)
 
-# Версия 1 библиотеки (оригинальная)
-add_library(math_ops SHARED ${LIB_TARGET_DIR}/math_ops.cpp)
-target_include_directories(math_ops PUBLIC ${LIB_TARGET_DIR})
-set_target_properties(math_ops PROPERTIES 
-    OUTPUT_NAME "math_ops"
-    PREFIX "lib"
+# Поиск библиотеки libcap
+find_library(LIB_CAP NAMES cap)
+if(NOT LIB_CAP)
+    message(WARNING "libcap not found. Install libcap-dev or equivalent for capability support.")
+endif()
+
+# Директории с заголовками
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/headers
+    ${CMAKE_CURRENT_SOURCE_DIR}/headers/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/headers/daemon
+    ${CMAKE_CURRENT_SOURCE_DIR}/headers/frontend
 )
 
-# Версия 2 библиотеки (первая модификация)
-add_library(math_ops_v2 SHARED ${LIB_TARGET_DIR}/math_ops_v2.cpp)
-target_include_directories(math_ops_v2 PUBLIC ${LIB_TARGET_DIR})
-set_target_properties(math_ops_v2 PROPERTIES 
-    OUTPUT_NAME "math_ops_v2"
-    PREFIX "lib"
+# Основная утилита
+add_executable(dl_manager
+    src/main/frontend.cpp
 )
 
-# Версия 3 библиотеки (вторая модификация)
-add_library(math_ops_v3 SHARED ${LIB_TARGET_DIR}/math_ops_v3.cpp)
-target_include_directories(math_ops_v3 PUBLIC ${LIB_TARGET_DIR})
-set_target_properties(math_ops_v3 PROPERTIES 
-    OUTPUT_NAME "math_ops_v3"
-    PREFIX "lib"
+target_link_libraries(dl_manager PRIVATE 
+    dl 
+    pthread
+    nlohmann_json::nlohmann_json
+    ${LIB_CAP}
 )
 
-# Целевая программа (использует библиотеку)
-add_executable(target_program src/target_program.cpp)
-target_include_directories(target_program PRIVATE ${LIB_TARGET_DIR})
-target_link_libraries(target_program PRIVATE math_ops dl)
+# Демон
+add_executable(dl_manager_daemon
+    src/daemon/daemon.cpp
+)
 
-# Программа сканера
-add_executable(scanner_test src/scanner_test.cpp)
-target_include_directories(scanner_test PRIVATE headers ${LIB_TARGET_DIR})
-target_link_libraries(scanner_test PRIVATE dl)
+target_link_libraries(dl_manager_daemon PRIVATE 
+    dl 
+    pthread
+    nlohmann_json::nlohmann_json
+    ${LIB_CAP}
+)
 
-# Отладочная программа
-add_executable(debug_maps src/debug_maps.cpp)
-target_include_directories(debug_maps PRIVATE headers)
+install(TARGETS dl_manager dl_manager_daemon RUNTIME DESTINATION bin)
 
-install(TARGETS math_ops math_ops_v2 math_ops_v3 LIBRARY DESTINATION lib)
-install(TARGETS target_program scanner_test debug_maps RUNTIME DESTINATION bin)
+# Проверка наличия setcap
+find_program(SETCAP setcap)
+if(NOT SETCAP)
+    message(WARNING "setcap not found. Install libcap-bin or equivalent to enable capability setting.")
+endif()
 
-# Дополнительная информация при сборке
-message(STATUS "Build configuration:")
-message(STATUS "  Libraries will be installed to: ${CMAKE_INSTALL_PREFIX}/lib")
-message(STATUS "  Executables will be installed to: ${CMAKE_INSTALL_PREFIX}/bin")
-message(STATUS "  Library versions: v1 (math_ops), v2 (math_ops_v2), v3 (math_ops_v3)")
+# Инструкция по установке capability
+message(STATUS "")
+message(STATUS "=== Ptrace Capability Note ===")
+message(STATUS "To trace processes not started by this program, you need CAP_SYS_PTRACE capability.")
+message(STATUS "Run the following commands after build (requires sudo):")
+message(STATUS "  sudo setcap cap_sys_ptrace=eip ${CMAKE_BINARY_DIR}/dl_manager")
+message(STATUS "  sudo setcap cap_sys_ptrace=eip ${CMAKE_BINARY_DIR}/dl_manager_daemon")
+message(STATUS "Or use the 'cap' target: make cap")
+message(STATUS "================================")
 
-# Маленькая тестовая библиотека для GOT-патча
-add_library(tiny_math_ops_v1 SHARED lib_target/tiny_math_ops_v1.cpp)
-target_include_directories(tiny_math_ops_v1 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
-set_target_properties(tiny_math_ops_v1 PROPERTIES OUTPUT_NAME "tiny_math_ops_v1" PREFIX "lib")
+# Цель для установки capability (требует sudo)
+if(SETCAP)
+    add_custom_target(cap
+        COMMAND sudo ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager>
+        COMMAND sudo ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager_daemon>
+        COMMENT "Granting CAP_SYS_PTRACE capability to executables (requires sudo password)"
+    )
+endif()
 
-add_library(tiny_math_ops_v2 SHARED lib_target/tiny_math_ops_v2.cpp)
-target_include_directories(tiny_math_ops_v2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
-set_target_properties(tiny_math_ops_v2 PROPERTIES OUTPUT_NAME "tiny_math_ops_v2" PREFIX "lib")
+find_program(SETCAP setcap REQUIRED)
+find_program(SUDO sudo REQUIRED)
 
-# Целевая программа для маленькой библиотеки
-add_executable(target_program_tiny src/target_program_tiny.cpp)
-target_include_directories(target_program_tiny PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
-target_link_libraries(target_program_tiny PRIVATE tiny_math_ops_v1 dl)
+add_custom_command(TARGET dl_manager POST_BUILD
+    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager>
+    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager_daemon>
+    COMMAND ${SUDO} chmod u+s $<TARGET_FILE:dl_manager>
+    COMMAND ${SUDO} chmod u+s $<TARGET_FILE:dl_manager_daemon>
+    COMMAND echo "✅ CAP_SYS_PTRACE capability and setuid bit added successfully"
+    COMMENT "Adding CAP_SYS_PTRACE and setuid to allow ptrace without sudo (requires password)"
+)
 
-# Программа для замены маленькой библиотеки
-add_executable(tiny_scanner_test src/tiny_scanner_test.cpp)
-target_include_directories(tiny_scanner_test PRIVATE headers ${CMAKE_CURRENT_SOURCE_DIR}/lib_target)
-target_link_libraries(tiny_scanner_test PRIVATE dl)
+# Тесты
+option(BUILD_TESTS "Build tests" OFF)
+if(BUILD_TESTS)
+    add_subdirectory(tests)
+endif()

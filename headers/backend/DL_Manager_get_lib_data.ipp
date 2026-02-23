@@ -42,7 +42,7 @@ void DL_Manager::print_loaded_libraries() const {
         LOG_INFO("  No libraries found.");
     } else {
         for (const auto& lib : libs) {
-            LOG_INFO("  %s", lib.c_str());
+            LOG_INFO("  %s", lib.c_str());  
         }
     }
 }
