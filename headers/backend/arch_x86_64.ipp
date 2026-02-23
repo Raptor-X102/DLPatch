@@ -66,14 +66,17 @@ inline std::vector<uint8_t> generate_dlopen_shellcode(uintptr_t path_addr, uintp
 }
 
 inline std::vector<uint8_t> generate_dlclose_shellcode(uintptr_t handle, uintptr_t dlclose_addr, uintptr_t result_addr) {
-    std::vector<uint8_t> code = {
-        // Save registers (minimal set)
+    std::vector<uint8_t> shellcode = {
+        // prologue: save registers
         0x55,                               // push rbp
+        0x48, 0x89, 0xe5,                   // mov rbp, rsp
         0x53,                               // push rbx
-        0x41, 0x54,                         // push r12
         
-        // Save result_addr in r12
-        0x49, 0xbc,                         // mov r12, imm64
+        // align stack (after 2 pushes = 16 bytes, need 8 more for call alignment)
+        0x48, 0x83, 0xec, 0x08,             // sub rsp, 8
+        
+        // save result_addr in rbx (callee-saved)
+        0x48, 0xbb,                         // mov rbx, imm64
         (uint8_t)((result_addr >> 0) & 0xff),
         (uint8_t)((result_addr >> 8) & 0xff),
         (uint8_t)((result_addr >> 16) & 0xff),
@@ -83,7 +86,7 @@ inline std::vector<uint8_t> generate_dlclose_shellcode(uintptr_t handle, uintptr
         (uint8_t)((result_addr >> 48) & 0xff),
         (uint8_t)((result_addr >> 56) & 0xff),
         
-        // Set handle in rdi
+        // first argument: handle -> rdi
         0x48, 0xbf,                         // mov rdi, imm64
         (uint8_t)((handle >> 0) & 0xff),
         (uint8_t)((handle >> 8) & 0xff),
@@ -94,7 +97,7 @@ inline std::vector<uint8_t> generate_dlclose_shellcode(uintptr_t handle, uintptr
         (uint8_t)((handle >> 48) & 0xff),
         (uint8_t)((handle >> 56) & 0xff),
         
-        // Load dlclose address
+        // dlclose address -> rax
         0x48, 0xb8,                         // mov rax, imm64
         (uint8_t)((dlclose_addr >> 0) & 0xff),
         (uint8_t)((dlclose_addr >> 8) & 0xff),
@@ -105,51 +108,24 @@ inline std::vector<uint8_t> generate_dlclose_shellcode(uintptr_t handle, uintptr
         (uint8_t)((dlclose_addr >> 48) & 0xff),
         (uint8_t)((dlclose_addr >> 56) & 0xff),
         
-        // Align stack to 16 bytes
-        0x48, 0x83, 0xec, 0x08,             // sub rsp, 8
+        // call dlclose
+        0xff, 0xd0,                         // call rax
         
-        // === CRITICAL CHANGE: Set up return address ===
-        // Push address of our trap instruction (current IP + 0x1c)
-        // This ensures dlclose returns to our int3, not random stack garbage
-        0x48, 0x8d, 0x05, 0x19, 0x00, 0x00, 0x00,  // lea rax, [rip+0x19]  (points to int3)
-        0x50,                                        // push rax
+        // save result (rax) to [rbx]
+        0x48, 0x89, 0x03,                   // mov [rbx], rax
         
-        // Now call dlclose (this will use our pushed return address)
-        0x48, 0xb8,                         // mov rax, dlclose_addr (again)
-        (uint8_t)((dlclose_addr >> 0) & 0xff),
-        (uint8_t)((dlclose_addr >> 8) & 0xff),
-        (uint8_t)((dlclose_addr >> 16) & 0xff),
-        (uint8_t)((dlclose_addr >> 24) & 0xff),
-        (uint8_t)((dlclose_addr >> 32) & 0xff),
-        (uint8_t)((dlclose_addr >> 40) & 0xff),
-        (uint8_t)((dlclose_addr >> 48) & 0xff),
-        (uint8_t)((dlclose_addr >> 56) & 0xff),
+        // restore stack alignment
+        0x48, 0x83, 0xc4, 0x08,             // add rsp, 8
         
-        0xff, 0xd0,                         // call rax  (uses our pushed return address)
-        
-        // ===== This code executes after dlclose returns =====
-        // Save result to [r12]
-        0x49, 0x89, 0x04, 0x24,             // mov [r12], rax
-        
-        // Restore stack
-        0x48, 0x83, 0xc4, 0x10,             // add rsp, 16 (8 for alignment + 8 for pushed return address)
-        
-        // Restore registers
-        0x41, 0x5c,                         // pop r12
+        // restore registers
         0x5b,                               // pop rbx
         0x5d,                               // pop rbp
         
-        // Trap to debugger
-        0xcc,                               // int3
-        
-        // ===== This is where we want dlclose to return =====
-        // (target of lea rax, [rip+0x19] above)
-        // Save result (same as above, but we need it here too)
-        0x49, 0x89, 0x04, 0x24,             // mov [r12], rax
-        0xeb, 0xea                          // jmp back to restore code
+        // trap for debugger
+        0xcc                                // int3
     };
     
-    return code;
+    return shellcode;
 }
 
 inline std::vector<uint8_t> create_jmp_patch(uintptr_t from_addr, uintptr_t to_addr) {

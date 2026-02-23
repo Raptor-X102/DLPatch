@@ -186,11 +186,13 @@ private:
     // Library loading helpers (DL_Manager_replace.ipp)
     //-------------------------------------------------------------------------
     bool is_library_already_loaded(const std::string& lib_path, uintptr_t& base_addr, uintptr_t& handle);
+    bool is_library_active(const std::string& lib_path) const;
     uintptr_t get_loaded_library_base(const std::string& lib_path) const;
     
     //-------------------------------------------------------------------------
     // Thread control (DL_Manager_replace.ipp)
     //-------------------------------------------------------------------------
+    bool prepare_thread_for_injection(pid_t tid, struct user_regs_struct& prepared_regs);
     std::vector<pid_t> stop_threads_and_prepare_main(pid_t& main_tid, struct user_regs_struct& saved_regs);
     bool wait_for_threads_to_leave_library(const std::vector<pid_t>& all_tids,
                                            const std::vector<std::pair<uintptr_t, uintptr_t>>& segments,

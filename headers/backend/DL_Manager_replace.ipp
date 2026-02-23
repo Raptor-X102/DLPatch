@@ -232,6 +232,14 @@ bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_
     return false;
 }
 
+bool DL_Manager::is_library_active(const std::string& lib_path) const {
+    auto it = tracked_libraries_.find(lib_path);
+    if (it == tracked_libraries_.end()) {
+        return false;
+    }
+    return it->second.is_active;
+}
+
 bool DL_Manager::test_syscall(pid_t tid) {
     if (syscall_insn_ == 0) return false;
     uintptr_t result;
@@ -458,6 +466,41 @@ uintptr_t DL_Manager::get_loaded_library_base(const std::string& lib_path) const
     return 0;
 }
 
+bool DL_Manager::prepare_thread_for_injection(pid_t tid, struct user_regs_struct& prepared_regs) {
+    LOG_DBG("Preparing thread %d for injection", tid);
+    
+    for (int i = 0; i < 2; ++i) {
+        if (ptrace(PTRACE_SYSCALL, tid, nullptr, nullptr) == -1) {
+            LOG_ERR("ptrace SYSCALL failed during preparation (attempt %d)", i);
+            return false;
+        }
+        
+        int status;
+        waitpid(tid, &status, 0);
+        
+        if (!WIFSTOPPED(status)) {
+            LOG_ERR("Thread did not stop after PTRACE_SYSCALL (attempt %d)", i);
+            return false;
+        }
+        
+        int sig = WSTOPSIG(status);
+        if (sig != SIGTRAP) {
+            LOG_DBG("Thread stopped with signal %d (expected SIGTRAP)", sig);
+        }
+    }
+    
+    if (ptrace(PTRACE_GETREGS, tid, nullptr, &prepared_regs) == -1) {
+        LOG_ERR("Failed to get registers after preparation");
+        return false;
+    }
+    
+    LOG_DBG("Thread prepared: IP=0x%llx, SP=0x%llx", 
+            (unsigned long long)Arch::get_ip(prepared_regs),
+            (unsigned long long)Arch::get_sp(prepared_regs));
+    
+    return true;
+}
+
 uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
                                         uintptr_t& out_handle,
                                         struct user_regs_struct& saved_regs) {
@@ -671,34 +714,55 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         return false;
     }
     
-    struct user_regs_struct saved_regs;
-    pid_t main_tid;
-    std::vector<ThreadContext> contexts;
+    // Останавливаем все потоки
     std::vector<pid_t> tids = get_all_threads(pid_);
+    std::vector<ThreadContext> contexts;
     
     if (!stop_all_threads(tids, contexts)) {
         return false;
     }
     
-    main_tid = pid_;
+    // Выбираем рабочий поток
+    pid_t worker_tid = pid_;
     bool found = false;
     for (const auto& ctx : contexts) {
-        if (ctx.tid == main_tid) {
-            saved_regs = ctx.regs;
+        if (ctx.tid == worker_tid) {
             found = true;
             break;
         }
     }
     if (!found && !contexts.empty()) {
-        main_tid = contexts[0].tid;
-        saved_regs = contexts[0].regs;
+        worker_tid = contexts[0].tid;
+        LOG_INFO("Main thread not found, using thread %d for unload", worker_tid);
     }
     
-    bool result = unload_library_by_handle(main_tid, lib.handle, saved_regs);
+    // Подготавливаем поток к инъекции (выходим из системного вызова)
+    struct user_regs_struct prepared_regs;
+    if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
+        restore_and_detach_all(contexts);
+        return false;
+    }
+    
+    // Проверяем, что syscall работает
+    if (!test_syscall(worker_tid)) {
+        LOG_ERR("Syscall test failed before unload");
+        restore_and_detach_all(contexts);
+        return false;
+    }
+    
+    // Выгружаем библиотеку
+    LOG_INFO("Calling unload_library_by_handle with handle=0x%lx", lib.handle);
+    bool result = unload_library_by_handle(worker_tid, lib.handle, prepared_regs);
+    
     if (result) {
-        invalidate_cache(lib.base_addr);  
+        invalidate_cache(lib.base_addr);
         tracked_libraries_.erase(it);
-    } 
+        LOG_INFO("Library %s successfully unloaded", lib_path.c_str());
+    } else {
+        LOG_ERR("Failed to unload library %s", lib_path.c_str());
+    }
+    
+    // Восстанавливаем и открепляем все потоки
     restore_and_detach_all(contexts);
     
     return result;
@@ -975,6 +1039,9 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
                                         struct user_regs_struct& saved_regs) {
     LOG_DBG("Cleaning up old libraries...");
     
+    // Сначала подготавливаем поток для каждого вызова unload
+    struct user_regs_struct prepared_regs = saved_regs;  // копируем сохранённые регистры
+    
     std::set<std::string> to_unload;
     for (const auto& pair : tracked_libraries_) {
         const TrackedLibrary& lib = pair.second;
@@ -989,7 +1056,11 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
         auto it = tracked_libraries_.find(path);
         if (it != tracked_libraries_.end() && it->second.handle != 0) {
             LOG_INFO("Unloading unused library: %s", path.c_str());
-            if (unload_library_by_handle(tid, it->second.handle, saved_regs)) {
+            
+            // Подготавливаем поток перед каждым unload
+            struct user_regs_struct current_prepared = prepared_regs;
+            
+            if (unload_library_by_handle(tid, it->second.handle, current_prepared)) {
                 invalidate_cache(it->second.base_addr);
                 tracked_libraries_.erase(it);
             } else {
@@ -1022,6 +1093,24 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
 
     std::string clean_target_path = trim(target_info.path);
     
+    auto target_it = tracked_libraries_.find(clean_target_path);
+    if (target_it != tracked_libraries_.end()) {
+        TrackedLibrary& target_lib = target_it->second;
+        
+        if (target_lib.is_active && !target_lib.is_original) {
+            LOG_ERR("Cannot replace active non-original library. Target library is currently in use.");
+            LOG_ERR("Use rollback first or unload it before replacement.");
+            LOG_RESULT("=== Library replacement failed (target is active and not original) ===");
+            return false;
+        }
+        
+        if (target_lib.is_original) {
+            LOG_INFO("Target is original library - replacement allowed");
+        }
+    } else {
+        LOG_INFO("Target library not in tracker - assuming it's safe to replace");
+    }
+
     if (tracked_libraries_.find(clean_target_path) == tracked_libraries_.end()) {
         TrackedLibrary target_lib(clean_target_path, 0, target_info.base_addr, std::vector<std::string>());
         target_lib.is_original = true;
@@ -1083,24 +1172,8 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
     }
 
-    for (int i = 0; i < 2; ++i) {
-        if (ptrace(PTRACE_SYSCALL, worker_tid, nullptr, nullptr) == -1) {
-            LOG_ERR("ptrace SYSCALL failed during preparation");
-            restore_and_detach_all(contexts);
-            return false;
-        }
-        int status;
-        waitpid(worker_tid, &status, 0);
-        if (!WIFSTOPPED(status)) {
-            LOG_ERR("Thread did not stop after PTRACE_SYSCALL (attempt %d)", i);
-            restore_and_detach_all(contexts);
-            return false;
-        }
-    }
-
     struct user_regs_struct prepared_regs;
-    if (ptrace(PTRACE_GETREGS, worker_tid, nullptr, &prepared_regs) == -1) {
-        LOG_ERR("Failed to get registers after preparation");
+    if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
         restore_and_detach_all(contexts);
         return false;
     }
