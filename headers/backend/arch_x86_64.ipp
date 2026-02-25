@@ -189,10 +189,26 @@ bool remote_syscall(pid_t pid, uintptr_t& result, long number,
                     uintptr_t arg1, uintptr_t arg2, uintptr_t arg3,
                     uintptr_t arg4, uintptr_t arg5, uintptr_t arg6,
                     uintptr_t syscall_insn_addr) {
+    
+    LOG_DBG("remote_syscall: pid=%d, syscall=%ld, syscall_insn_addr=0x%lx", 
+            pid, number, syscall_insn_addr);
+    LOG_DBG("  args: 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx",
+            arg1, arg2, arg3, arg4, arg5, arg6);
+    
+    // Save current registers
     user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1) return false;
+    if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1) {
+        LOG_ERR("  PTRACE_GETREGS failed: %s", strerror(errno));
+        return false;
+    }
+    LOG_DBG("  Saved regs: IP=0x%llx, SP=0x%llx, RAX=0x%llx",
+            (unsigned long long)get_ip(regs),
+            (unsigned long long)get_sp(regs),
+            (unsigned long long)get_syscall_ret(regs));
+    
     user_regs_struct saved = regs;
     
+    // Set up registers for syscall
     set_syscall_num(regs, number);
     set_arg0(regs, arg1);
     set_arg1(regs, arg2);
@@ -202,16 +218,53 @@ bool remote_syscall(pid_t pid, uintptr_t& result, long number,
     set_arg5(regs, arg6);
     set_ip(regs, syscall_insn_addr);
     
-    if (ptrace(PTRACE_SETREGS, pid, nullptr, &regs) == -1) return false;
-    if (ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr) == -1) return false;
+    LOG_DBG("  Set regs for syscall: IP=0x%llx, SYSCALL=%ld",
+            (unsigned long long)get_ip(regs), get_syscall_num(regs));
+    
+    if (ptrace(PTRACE_SETREGS, pid, nullptr, &regs) == -1) {
+        LOG_ERR("  PTRACE_SETREGS failed: %s", strerror(errno));
+        return false;
+    }
+    
+    LOG_DBG("  Doing PTRACE_SINGLESTEP...");
+    if (ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr) == -1) {
+        LOG_ERR("  PTRACE_SINGLESTEP failed: %s", strerror(errno));
+        return false;
+    }
     
     int status;
     waitpid(pid, &status, 0);
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) return false;
+    LOG_DBG("  waitpid returned status=0x%x", status);
     
-    if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1) return false;
+    if (!WIFSTOPPED(status)) {
+        LOG_ERR("  Thread did not stop after singlestep");
+        return false;
+    }
+    
+    int sig = WSTOPSIG(status);
+    LOG_DBG("  Thread stopped with signal %d", sig);
+    
+    if (sig != SIGTRAP) {
+        LOG_ERR("  Expected SIGTRAP, got %d", sig);
+        return false;
+    }
+    
+    // Get result
+    if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1) {
+        LOG_ERR("  PTRACE_GETREGS after syscall failed: %s", strerror(errno));
+        return false;
+    }
+    
     result = get_syscall_ret(regs);
-    ptrace(PTRACE_SETREGS, pid, nullptr, &saved);
+    LOG_DBG("  Syscall returned 0x%lx (%ld)", result, result);
+    
+    // Restore original registers
+    if (ptrace(PTRACE_SETREGS, pid, nullptr, &saved) == -1) {
+        LOG_ERR("  Failed to restore registers: %s", strerror(errno));
+        // Don't return false here - we already have the result
+    }
+    
+    LOG_DBG("  remote_syscall successful");
     return true;
 }
 

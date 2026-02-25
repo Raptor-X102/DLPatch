@@ -116,9 +116,12 @@ struct DynamicInfo {
 };
 
 enum class LoadResult {
-    LOADED_NEW,        // Loaded new copy of library
-    USED_EXISTING,     // Using existing (library was not changed)
-    FAILED             // Loading failed
+    NOT_FOUND,         // Library not found in tracker or maps
+    CHANGED,           // File changed, needs reload
+    LOADED_NEW,        // New copy of library was loaded
+    USED_EXISTING,     // Existing copy used (file unchanged, but library may be inactive)
+    ALREADY_ACTIVE,    // Library already active and unchanged - nothing to do
+    FAILED             // Failed to load library
 };
 
 //=============================================================================
@@ -349,6 +352,12 @@ private:
                            const std::string &target_function);
 
     bool check_preconditions(const std::string &target_lib_pattern);
+    LoadResult check_library_state(const std::string& lib_path,
+                                    uintptr_t& base, 
+                                    uintptr_t& handle,
+                                    bool check_active_only = false);
+    
+    // Load library (needs thread)
     LoadResult ensure_new_library_loaded(pid_t tid,
                                          const std::string& new_lib_path,
                                          uintptr_t& new_lib_base,
