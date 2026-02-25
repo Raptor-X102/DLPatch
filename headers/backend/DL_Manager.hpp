@@ -159,7 +159,7 @@ public:
     get_function_symbols(uintptr_t lib_base) const; // Get all function symbols
     bool is_exported_function(const SymbolInfo& sym) const;
 
-    const SymbolInfo* find_symbol(uintptr_t lib_base, const std::string& sym_name) const;
+    const SymbolInfo* find_symbol_direct(uintptr_t lib_base, const std::string& sym_name) const;
     //-------------------------------------------------------------------------
     // GOT entry lookup (DL_Manager_GOT.ipp)
     //-------------------------------------------------------------------------

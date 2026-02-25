@@ -1,6 +1,7 @@
 #include <elf.h>
 #include <vector>
 #include <cstring>
+#include <functional>
 
 static bool read_elf_header(pid_t pid, uintptr_t lib_base, Elf64_Ehdr& ehdr) {
     if (!read_struct(pid, lib_base, ehdr)) {
@@ -111,4 +112,69 @@ static bool parse_dynamic_info(pid_t pid, uintptr_t lib_base, DynamicInfo& info)
         return false;
     }
     return true;
+}
+
+//=============================================================================
+// Symbol iteration utilities (added to eliminate duplication)
+//=============================================================================
+
+// Callback type: return false to stop iteration, true to continue
+//=============================================================================
+// Symbol iteration utilities
+//=============================================================================
+
+// Callback type: return false to stop iteration, true to continue
+// Note: index parameter removed since it wasn't used anywhere
+//=============================================================================
+// Symbol iteration utilities
+//=============================================================================
+
+// Callback type: return false to stop iteration, true to continue
+using SymbolCallback = std::function<bool(const Elf64_Sym& sym, const std::string& name)>;
+
+static bool iterate_dynamic_symbols(pid_t pid, const DynamicInfo& info, const SymbolCallback& callback) {
+    uint32_t nchain = 0;
+
+    // Determine number of symbols from hash table
+    if (info.hash != 0) {
+        uint32_t nbucket;
+        if (!read_struct(pid, info.hash, nbucket) || !read_struct(pid, info.hash + 4, nchain))
+            return false;
+    } else if (info.gnu_hash != 0) {
+        nchain = parse_gnu_hash(pid, info.gnu_hash);
+        if (nchain == 0) nchain = 10000; // fallback
+    } else {
+        nchain = 10000; // fallback
+    }
+
+    for (uint32_t i = 0; i < nchain; ++i) {
+        Elf64_Sym sym;
+        uintptr_t sym_addr = info.symtab + i * info.syment;
+        if (!read_struct(pid, sym_addr, sym)) {
+            if (i > 0) break; // If we fail after first symbol, assume end of table
+            continue;          // If first symbol fails, maybe table is empty?
+        }
+
+        if (sym.st_name == 0) continue;
+
+        uintptr_t name_addr = info.strtab + sym.st_name;
+        std::string name = read_string(pid, name_addr, info.strsz);
+        if (name.empty()) continue;
+
+        if (!callback(sym, name)) {
+            break; // Stop if callback returns false
+        }
+    }
+
+    return true;
+}
+
+static bool iterate_dynamic_symbols(pid_t pid, uintptr_t lib_base, const SymbolCallback& callback) {
+    DynamicInfo info;
+    if (!parse_dynamic_info(pid, lib_base, info)) {
+        LOG_DBG("iterate_dynamic_symbols: failed to parse dynamic info at 0x%lx", lib_base);
+        return false;
+    }
+    // Delegate to the version with pre-parsed info (lib_base not needed)
+    return iterate_dynamic_symbols(pid, info, callback);
 }

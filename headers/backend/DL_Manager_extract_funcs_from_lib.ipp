@@ -7,11 +7,24 @@
 #include <iostream>
 #include <cxxabi.h>
 
-/**
- * Check if a symbol is a patchable exported function
- * @param sym Symbol information to check
- * @return true if the symbol can be patched, false otherwise
- */
+const SymbolInfo* DL_Manager::find_symbol_direct(uintptr_t lib_base, const std::string& sym_name) const {
+    const SymbolInfo* result = nullptr;
+
+    iterate_dynamic_symbols(pid_, lib_base, [&](const Elf64_Sym& sym, const std::string& name) {
+        if (name == sym_name && sym.st_value != 0) {
+            int type = ELF64_ST_TYPE(sym.st_info);
+            int bind = ELF64_ST_BIND(sym.st_info);
+            int vis = ELF64_ST_VISIBILITY(sym.st_other);
+
+            result = new SymbolInfo(name, lib_base + sym.st_value, sym.st_size, type, bind, vis);
+            return false; // Stop iteration
+        }
+        return true; // Continue
+    });
+
+    return result;
+}
+
 bool DL_Manager::is_exported_function(const SymbolInfo& sym) const {
     // Basic ELF checks for patchable functions
     if (sym.type != STT_FUNC) return false;                          // Must be a function
@@ -39,15 +52,11 @@ bool DL_Manager::is_exported_function(const SymbolInfo& sym) const {
     return true;
 }
 
-/**
- * Get all patchable functions from a library
- * @param lib_base Base address of the library
- * @return Vector of symbols that can be safely patched
- */
 std::vector<SymbolInfo> DL_Manager::get_function_symbols(uintptr_t lib_base) const {
+    // Ensure cache is populated for this library
     ensure_cache(lib_base);
-    std::vector<SymbolInfo> result;
     
+    std::vector<SymbolInfo> result;
     for (const auto& sym : library_cache_[lib_base].symbols) {
         if (is_exported_function(sym)) {
             result.push_back(sym);
@@ -59,52 +68,20 @@ std::vector<SymbolInfo> DL_Manager::get_function_symbols(uintptr_t lib_base) con
     return result;
 }
 
-/**
- * Get symbol address (only for patchable functions)
- * @param lib_base Base address of the library
- * @param sym_name Name of the symbol
- * @return Address or 0 if not found or not patchable
- */
 uintptr_t DL_Manager::get_symbol_address(uintptr_t lib_base, const std::string& sym_name) const {
-    const SymbolInfo* sym = find_symbol(lib_base, sym_name);
+    const SymbolInfo* sym = find_symbol_direct(lib_base, sym_name);
     if (!sym) return 0;
     
-    if (is_exported_function(*sym)) {
-        return sym->addr;
-    }
-    return 0;
+    uintptr_t addr = sym->addr;
+    delete sym;
+    return addr;
 }
 
-/**
- * Get symbol size (only for patchable functions)
- * @param lib_base Base address of the library
- * @param sym_name Name of the symbol
- * @return Size or 0 if not found or not patchable
- */
 size_t DL_Manager::get_symbol_size(uintptr_t lib_base, const std::string& sym_name) const {
-    const SymbolInfo* sym = find_symbol(lib_base, sym_name);
+    const SymbolInfo* sym = find_symbol_direct(lib_base, sym_name);
     if (!sym) return 0;
     
-    if (is_exported_function(*sym)) {
-        return sym->size;
-    }
-    return 0;
-} 
-
-/**
- * Find symbol by name (internal helper)
- * @param lib_base Base address of the library
- * @param sym_name Name of the symbol to find
- * @return Pointer to SymbolInfo or nullptr if not found
- */
-const SymbolInfo* DL_Manager::find_symbol(uintptr_t lib_base, const std::string& sym_name) const {
-    ensure_cache(lib_base);
-    const auto& syms = library_cache_[lib_base].symbols;
-    
-    for (const auto& s : syms) {
-        if (s.name == sym_name) {
-            return &s;
-        }
-    }
-    return nullptr;
+    size_t size = sym->size;
+    delete sym;
+    return size;
 }
