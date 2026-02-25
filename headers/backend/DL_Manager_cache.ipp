@@ -36,17 +36,19 @@ inline std::vector<SymbolInfo> DL_Manager::parse_symbols_from_dynamic(uintptr_t 
     std::vector<SymbolInfo> symbols;
     uint32_t nchain = 0;
 
+    // Determine number of symbols from hash table
     if (info.hash != 0) {
         uint32_t nbucket;
         if (!read_struct(pid_, info.hash, nbucket) || !read_struct(pid_, info.hash + 4, nchain))
             return symbols;
     } else if (info.gnu_hash != 0) {
         nchain = parse_gnu_hash(pid_, info.gnu_hash);
-        if (nchain == 0) nchain = 10000;
+        if (nchain == 0) nchain = 10000; // Fallback
     } else {
-        nchain = 10000;
+        nchain = 10000; // Fallback
     }
 
+    // Iterate through symbol table
     for (uint32_t i = 0; i < nchain; ++i) {
         Elf64_Sym sym;
         uintptr_t sym_addr = info.symtab + i * info.syment;
@@ -54,17 +56,60 @@ inline std::vector<SymbolInfo> DL_Manager::parse_symbols_from_dynamic(uintptr_t 
             if (i > 0) break;
             continue;
         }
-        if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
-        if (sym.st_name == 0 || sym.st_value == 0) continue;
-
+        
+        int type = ELF64_ST_TYPE(sym.st_info);
+        int bind = ELF64_ST_BIND(sym.st_info);
+        int vis = ELF64_ST_VISIBILITY(sym.st_other);
+        
+        // Quick filter for functions we might want to patch
+        bool is_patchable = true;
+        
+        // Must be a function
+        if (type != STT_FUNC) {
+            is_patchable = false;
+        }
+        // Must have a name and valid address
+        else if (sym.st_name == 0 || sym.st_value == 0) {
+            is_patchable = false;
+        }
+        // Must be global or weak (exported)
+        else if (bind != STB_GLOBAL && bind != STB_WEAK) {
+            is_patchable = false;
+        }
+        // Must have default visibility (not hidden)
+        else if (vis != STV_DEFAULT) {
+            is_patchable = false;
+        }
+        // Must have non-zero size (not a PLT stub)
+        else if (sym.st_size == 0) {
+            is_patchable = false;
+        }
+        
+        if (!is_patchable) {
+            continue;
+        }
+        
+        // Read symbol name
         uintptr_t name_addr = info.strtab + sym.st_name;
         std::string name = read_string(pid_, name_addr, info.strsz);
-        if (!name.empty())
-            symbols.emplace_back(name, lib_base + sym.st_value, sym.st_size);
+        
+        // Additional sanity check - name shouldn't be empty
+        if (name.empty()) {
+            continue;
+        }
+        
+        // Add to list
+        symbols.emplace_back(name, lib_base + sym.st_value, sym.st_size, type, bind, vis);
+        
+        LOG_DBG("Found exported function: %s at 0x%lx (size=%zu)", 
+                name.c_str(), lib_base + sym.st_value, sym.st_size);
     }
 
+    // Sort symbols by name for easier lookup
     std::sort(symbols.begin(), symbols.end(),
               [](const auto& a, const auto& b) { return a.name < b.name; });
+    
+    LOG_DBG("Parsed %zu exported functions from library at 0x%lx", symbols.size(), lib_base);
     return symbols;
 }
 

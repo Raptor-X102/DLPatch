@@ -7,7 +7,9 @@
 #include <map>
 #include <cstdint>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/user.h>
+#include <elf.h>
 #include "logging.hpp"
 
 //=============================================================================
@@ -28,10 +30,8 @@ struct TrackedLibrary {
     std::string path;                           // Library path (used as key)
     uintptr_t handle;                           // Handle returned by dlopen
     uintptr_t base_addr;                        // Base address in memory
-    std::vector<std::string> 
-        patched_functions; // Functions patched from other libraries
-    std::vector<std::string> 
-        provided_functions; // All functions this library exports
+    std::vector<std::string> patched_functions; // Functions patched from other libraries
+    std::vector<std::string> provided_functions; // All functions this library exports
     std::vector<std::string>
         patched_libraries; // Libraries that were patched to point to this one
     bool is_active;        // Whether this library is currently the target of any patch
@@ -40,6 +40,10 @@ struct TrackedLibrary {
         saved_original_bytes; // Original bytes for JMP patch rollback
     std::map<std::string, uintptr_t>
         saved_original_got; // Original GOT values for GOT patch rollback
+
+    // Fields for library identification
+    time_t mtime;     // File modification time
+    size_t file_size; // File size
 
     // Constructors
     TrackedLibrary()
@@ -74,18 +78,16 @@ struct TrackedLibrary {
 
 // Symbol information
 struct SymbolInfo {
-    std::string name; // Symbol name
-    uintptr_t addr;   // Symbol address in memory
-    size_t size;      // Symbol size in bytes
-
-    // Constructors
-    SymbolInfo()
-        : addr(0)
-        , size(0) {}
-    SymbolInfo(const std::string &n, uintptr_t a, size_t s)
-        : name(n)
-        , addr(a)
-        , size(s) {}
+    std::string name;
+    uintptr_t addr;
+    size_t size;
+    int type;      // STT_FUNC, STT_OBJECT, etc.
+    int bind;      // STB_GLOBAL, STB_LOCAL, STB_WEAK
+    int visibility; // STV_DEFAULT, STV_HIDDEN, STV_PROTECTED
+    
+    SymbolInfo(const std::string& n, uintptr_t a, size_t s, 
+               int t = STT_FUNC, int b = STB_GLOBAL, int v = STV_DEFAULT)
+        : name(n), addr(a), size(s), type(t), bind(b), visibility(v) {}
 };
 
 // Thread context for stop/resume operations
@@ -155,7 +157,9 @@ public:
                            const std::string &sym_name) const; // Get symbol size
     std::vector<SymbolInfo>
     get_function_symbols(uintptr_t lib_base) const; // Get all function symbols
+    bool is_exported_function(const SymbolInfo& sym) const;
 
+    const SymbolInfo* find_symbol(uintptr_t lib_base, const std::string& sym_name) const;
     //-------------------------------------------------------------------------
     // GOT entry lookup (DL_Manager_GOT.ipp)
     //-------------------------------------------------------------------------
@@ -241,6 +245,8 @@ private:
     bool is_library_already_loaded(const std::string &lib_path,
                                    uintptr_t &base_addr,
                                    uintptr_t &handle);
+
+    bool is_library_in_maps(const std::string &lib_path, uintptr_t &base_addr) const;
     bool is_library_active(const std::string &lib_path) const;
     uintptr_t get_loaded_library_base(const std::string &lib_path) const;
 
@@ -262,9 +268,9 @@ private:
     //-------------------------------------------------------------------------
     uintptr_t allocate_remote_memory(pid_t tid, size_t size);
     bool write_shellcode(pid_t tid,
-                                           uintptr_t shellcode_addr,
-                                           uintptr_t path_addr,
-                                           uintptr_t result_addr);
+                         uintptr_t shellcode_addr,
+                         uintptr_t path_addr,
+                         uintptr_t result_addr);
     bool execute_shellcode_and_get_handle(pid_t tid,
                                           uintptr_t shellcode_addr,
                                           struct user_regs_struct &saved_regs,
@@ -294,16 +300,14 @@ private:
                      uintptr_t old_func,
                      uintptr_t new_func,
                      size_t old_func_size,
-                     const std::string &func_name,
-                     struct user_regs_struct &saved_regs);
+                     const std::string &func_name);
 
     bool apply_all_patches(pid_t tid,
                            const std::string &target_lib_path,
                            uintptr_t old_base,
                            uintptr_t new_base,
                            const std::string &new_lib_path,
-                           const std::string &target_function,
-                           struct user_regs_struct &saved_regs);
+                           const std::string &target_function);
 
     bool check_preconditions(const std::string &target_lib_pattern);
     bool ensure_new_library_loaded(pid_t tid,

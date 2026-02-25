@@ -8,6 +8,8 @@
 #include <unistd.h>
 
 std::atomic<int> g_counter{0};
+std::atomic<int> thread1_count{0};
+std::atomic<int> thread2_count{0};
 
 void worker_function(int id) {
     std::mt19937 rng(std::random_device{}());
@@ -22,10 +24,18 @@ void worker_function(int id) {
         int ft = forty_two();
         int m = max(a, b);
 
+        // Update thread-specific counters
+        if (id == 1)
+            thread1_count++;
+        if (id == 2)
+            thread2_count++;
+
+        // Each thread prints every 100th iteration
         if (g_counter++ % 100 == 0) {
-            std::cout << "Thread " << id << ": zero=" << z << ", one=" << o
-                      << ", forty_two=" << ft << ", max(" << a << "," << b << ")=" << m
-                      << std::endl;
+            std::cout << "Thread " << id << " (runs: "
+                      << (id == 1 ? thread1_count.load() : thread2_count.load())
+                      << "): zero=" << z << ", one=" << o << ", forty_two=" << ft
+                      << ", max(" << a << "," << b << ")=" << m << std::endl;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -48,6 +58,10 @@ int main() {
 
         double x = 10.0, y = 5.0;
         std::cout << "add: " << add(x, y) << std::endl;
+
+        // Also show thread run counts periodically
+        std::cout << "Thread stats - Thread 1 runs: " << thread1_count.load()
+                  << ", Thread 2 runs: " << thread2_count.load() << std::endl;
     }
 
     return 0;

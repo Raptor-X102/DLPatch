@@ -263,37 +263,34 @@ uintptr_t DL_Manager::find_syscall_instruction(uintptr_t libc_base) {
 // - true with base_addr/handle filled if found in tracker or /proc/pid/maps
 // - false if not found (library needs to be loaded)
 bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_t& base_addr, uintptr_t& handle) {
+    // Normalize path for tracker lookup
+    std::string normalized = normalize_path(lib_path);
+    
     // First check our tracker (libraries we loaded ourselves)
-    auto it = tracked_libraries_.find(lib_path);
+    auto it = tracked_libraries_.find(normalized);
     if (it != tracked_libraries_.end()) {
         base_addr = it->second.base_addr;
         handle = it->second.handle;
         return true;
     }
     
-    // If not in tracker, check /proc/pid/maps to see if process already has it
+    // If not in tracker, check /proc/pid/maps (using original path for string search)
     std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
     std::ifstream maps_file(maps_path);
-    if (!maps_file.is_open()) {
-        // Can't open maps - process probably died, but that's not our problem here
-        // Just return false and let caller handle it
-        return false;
-    }
+    if (!maps_file.is_open()) return false;
     
-    // Parse maps file line by line
     std::string line;
     while (std::getline(maps_file, line)) {
         if (line.find(lib_path) != std::string::npos) {
             size_t dash = line.find('-');
             if (dash != std::string::npos) {
-                // Extract base address (hex number before '-')
                 base_addr = std::stoul(line.substr(0, dash), nullptr, 16);
-                handle = 0; // No handle for libraries we didn't load
+                handle = 0;
                 return true;
             }
         }
     }
-    return false; // Not found anywhere
+    return false;
 }
 
 bool DL_Manager::is_library_active(const std::string& lib_path) const {
@@ -325,34 +322,9 @@ bool DL_Manager::test_syscall(pid_t tid) {
     return true;
 }
 
-std::vector<pid_t> DL_Manager::stop_threads_and_prepare_main(pid_t& main_tid, 
-                                                              struct user_regs_struct& saved_regs) {
-    std::vector<pid_t> tids = get_all_threads(pid_);
-    if (tids.empty()) {
-        LOG_ERR("No threads found");
-        return {};
-    }
-    
-    std::vector<ThreadContext> contexts;
-    if (!stop_all_threads(tids, contexts)) {
-        return {};
-    }
-    
-    main_tid = pid_;
-    bool found = false;
-    for (const auto& ctx : contexts) {
-        if (ctx.tid == main_tid) {
-            saved_regs = ctx.regs;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        LOG_ERR("Main thread not found in stopped threads");
-        restore_and_detach_all(contexts);
-        return {};
-    }
-    
+bool DL_Manager::prepare_thread_for_injection(pid_t tid, struct user_regs_struct& prepared_regs) {
+    LOG_DBG("Preparing thread %d for injection", tid);
+
     // Execute two PTRACE_SYSCALL steps to ensure thread is out of any syscall
     // Reason: If thread is inside a syscall when we try to execute shellcode,
     // the kernel will restart the syscall after we detach, corrupting program state
@@ -362,26 +334,79 @@ std::vector<pid_t> DL_Manager::stop_threads_and_prepare_main(pid_t& main_tid,
     // Second PTRACE_SYSCALL:
     //   - Ensures thread is stopped at a safe point (not inside any syscall)
     for (int i = 0; i < 2; ++i) {
-        if (ptrace(PTRACE_SYSCALL, main_tid, nullptr, nullptr) == -1) {
-            LOG_ERR("ptrace SYSCALL failed");
-            restore_and_detach_all(contexts);
-            return {};
+        if (ptrace(PTRACE_SYSCALL, tid, nullptr, nullptr) == -1) {
+            LOG_ERR("ptrace SYSCALL failed during preparation (attempt %d)", i);
+            return false;
         }
+        
         int status;
-        waitpid(main_tid, &status, 0);
+        waitpid(tid, &status, 0);
+        
         if (!WIFSTOPPED(status)) {
-            LOG_ERR("Thread did not stop after PTRACE_SYSCALL");
-            restore_and_detach_all(contexts);
-            return {};
+            LOG_ERR("Thread did not stop after PTRACE_SYSCALL (attempt %d)", i);
+            return false;
+        }
+        
+        int sig = WSTOPSIG(status);
+        if (sig != SIGTRAP) {
+            LOG_DBG("Thread stopped with signal %d (expected SIGTRAP)", sig);
         }
     }
     
-    if (ptrace(PTRACE_GETREGS, main_tid, nullptr, &saved_regs) == -1) {
-        LOG_ERR("ptrace GETREGS failed");
+    if (ptrace(PTRACE_GETREGS, tid, nullptr, &prepared_regs) == -1) {
+        LOG_ERR("Failed to get registers after preparation");
+        return false;
+    }
+    
+    LOG_DBG("Thread prepared: IP=0x%llx, SP=0x%llx", 
+            (unsigned long long)Arch::get_ip(prepared_regs),
+            (unsigned long long)Arch::get_sp(prepared_regs));
+    
+    return true;
+}
+
+std::vector<pid_t> DL_Manager::stop_threads_and_prepare_main(pid_t& main_tid, 
+                                                              struct user_regs_struct& saved_regs) {
+    std::vector<pid_t> tids = get_all_threads(pid_);
+    if (tids.empty()) {
+        LOG_ERR("No threads found - process may have terminated");
+        return {};
+    }
+    
+    std::vector<ThreadContext> contexts;
+    if (!stop_all_threads(tids, contexts)) {
+        LOG_ERR("Failed to stop all threads");
+        return {};
+    }
+    
+    // Find main thread and save its original registers
+    main_tid = pid_;
+    bool found = false;
+    for (const auto& ctx : contexts) {
+        if (ctx.tid == main_tid) {
+            saved_regs = ctx.regs;
+            found = true;
+            break;
+        }
+    }
+    
+    if (!found) {
+        LOG_ERR("Main thread not found in stopped threads");
         restore_and_detach_all(contexts);
         return {};
     }
     
+    // Prepare main thread for injection 
+    struct user_regs_struct prepared_regs;
+    if (!prepare_thread_for_injection(main_tid, prepared_regs)) {
+        restore_and_detach_all(contexts);
+        return {};
+    }
+    
+    // Update saved_regs with prepared state
+    saved_regs = prepared_regs;
+    
+    // Return all stopped thread IDs
     std::vector<pid_t> stopped_tids;
     for (const auto& ctx : contexts) {
         stopped_tids.push_back(ctx.tid);
@@ -555,41 +580,6 @@ uintptr_t DL_Manager::get_loaded_library_base(const std::string& lib_path) const
     return 0;
 }
 
-bool DL_Manager::prepare_thread_for_injection(pid_t tid, struct user_regs_struct& prepared_regs) {
-    LOG_DBG("Preparing thread %d for injection", tid);
-    
-    for (int i = 0; i < 2; ++i) {
-        if (ptrace(PTRACE_SYSCALL, tid, nullptr, nullptr) == -1) {
-            LOG_ERR("ptrace SYSCALL failed during preparation (attempt %d)", i);
-            return false;
-        }
-        
-        int status;
-        waitpid(tid, &status, 0);
-        
-        if (!WIFSTOPPED(status)) {
-            LOG_ERR("Thread did not stop after PTRACE_SYSCALL (attempt %d)", i);
-            return false;
-        }
-        
-        int sig = WSTOPSIG(status);
-        if (sig != SIGTRAP) {
-            LOG_DBG("Thread stopped with signal %d (expected SIGTRAP)", sig);
-        }
-    }
-    
-    if (ptrace(PTRACE_GETREGS, tid, nullptr, &prepared_regs) == -1) {
-        LOG_ERR("Failed to get registers after preparation");
-        return false;
-    }
-    
-    LOG_DBG("Thread prepared: IP=0x%llx, SP=0x%llx", 
-            (unsigned long long)Arch::get_ip(prepared_regs),
-            (unsigned long long)Arch::get_sp(prepared_regs));
-    
-    return true;
-}
-
 uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
                                         uintptr_t& out_handle,
                                         struct user_regs_struct& saved_regs) {
@@ -598,28 +588,34 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
         return 0;
     }
 
-    LOG_INFO("Loading new library: tid=%d, lib_path=%s", tid, lib_path.c_str());
+    LOG_INFO("Loading new library: %s", lib_path.c_str());
     LOG_DBG("dlopen_addr=0x%lx, syscall_insn=0x%lx", dlopen_addr_, syscall_insn_);
 
+#ifdef DEBUG
+    // Test remote syscall before proceeding (debug only)
     uintptr_t test_result;
     if (!Arch::remote_syscall(tid, test_result, Arch::SYS_GETPID, 0, 0, 0, 0, 0, 0, syscall_insn_)) {
         LOG_ERR("remote_syscall test failed before allocation");
         return 0;
     }
     LOG_DBG("remote_syscall test passed, result=%lu", test_result);
+#endif
 
+    // Allocate remote memory for shellcode
     uintptr_t remote_mem = allocate_remote_memory(tid, REMOTE_MEM_SIZE);
     if (remote_mem == 0) {
-        LOG_ERR("allocate_remote_memory failed");
+        LOG_ERR("Failed to allocate remote memory");
         return 0;
     }
-    LOG_INFO("Remote memory allocated at 0x%lx", remote_mem);
+    LOG_DBG("Remote memory allocated at 0x%lx", remote_mem);
 
+    // Calculate addresses for path and result
     uintptr_t path_addr = remote_mem + SHELLCODE_PATH_OFFSET;
     uintptr_t result_addr = remote_mem + SHELLCODE_RESULT_OFFSET;
     
     LOG_DBG("path_addr = 0x%lx, result_addr = 0x%lx", path_addr, result_addr);
 
+    // Write library path to remote memory
     if (!write_remote_memory(tid, path_addr, lib_path.c_str(), lib_path.size() + 1)) {
         LOG_ERR("Failed to write library path");
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
@@ -627,27 +623,34 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     }
     LOG_INFO("Library path written to remote memory");
 
+#ifdef DEBUG
+    // Verify path was written correctly (debug only)
     char path_check[256] = {0};
     if (read_remote_memory(tid, path_addr, path_check, lib_path.size() + 1)) {
         LOG_DBG("Path verification: %s", path_check);
     }
+#endif
 
+    // Write shellcode
     if (!write_shellcode(tid, remote_mem, path_addr, result_addr)) {
         LOG_ERR("Failed to write shellcode");
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
         return 0;
     }
-    LOG_INFO("Shellcode written to remote memory");
+    LOG_DBG("Shellcode written to remote memory");
 
+    // Execute shellcode and get dlopen handle
     if (!execute_shellcode_and_get_handle(tid, remote_mem, saved_regs, out_handle)) {
-        LOG_ERR("execute_shellcode_and_get_handle failed");
+        LOG_ERR("Failed to execute shellcode and get handle");
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
         return 0;
     }
 
-    LOG_INFO("Cleaning up remote memory");
+    // Clean up remote memory
+    LOG_DBG("Cleaning up remote memory");
     remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
 
+    // Find base address of newly loaded library in /proc/pid/maps
     uintptr_t new_lib_base = get_loaded_library_base(lib_path);
     if (new_lib_base == 0) {
         LOG_ERR("Failed to find new library base in maps");
@@ -660,16 +663,19 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
 
 bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
                                            struct user_regs_struct& saved_regs) {
+    // Check that required addresses are initialized
     if (dlclose_addr_ == 0 || syscall_insn_ == 0) {
         LOG_ERR("Required addresses not initialized");
         return false;
     }
     
+    // Validate handle
     if (handle == 0) {
         LOG_ERR("Invalid handle (0)");
         return false;
     }
     
+    // Allocate remote memory for unload shellcode
     size_t mem_size = 4096;
     uintptr_t remote_mem = remote_mmap(tid, mem_size,
                                        PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -680,16 +686,18 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
+    // Address where dlclose result will be stored
     uintptr_t result_addr = remote_mem + 256;
     
-    LOG_INFO("Unloading library with handle = 0x%lx", handle);
+    LOG_DBG("Unloading library with handle = 0x%lx", handle);
     LOG_DBG("Shellcode at: 0x%lx", remote_mem);
     LOG_DBG("Result addr: 0x%lx", result_addr);
     LOG_DBG("dlclose addr: 0x%lx", dlclose_addr_);
     
+    // Generate dlclose shellcode
     auto shellcode = Arch::generate_dlclose_shellcode(handle, dlclose_addr_, result_addr);
     
-    // Clear result area
+    // Clear result area before execution
     uint64_t zero = 0;
     if (!write_remote_memory(tid, result_addr, &zero, sizeof(zero))) {
         LOG_ERR("Failed to clear result area");
@@ -697,14 +705,14 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    // Write shellcode
+    // Write shellcode to remote memory
     if (!write_remote_memory(tid, remote_mem, shellcode.data(), shellcode.size())) {
         LOG_ERR("Failed to write unload shellcode");
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
-    // Set IP to shellcode
+    // Set instruction pointer to shellcode
     struct user_regs_struct new_regs = saved_regs;
     Arch::set_ip(new_regs, remote_mem);
     
@@ -714,13 +722,14 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    // Execute
+    // Execute shellcode
     if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) == -1) {
         LOG_ERR("ptrace CONT failed: %s", strerror(errno));
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
+    // Wait for shellcode to complete (should hit int3)
     int status;
     waitpid(tid, &status, 0);
     
@@ -732,14 +741,15 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         LOG_DBG("Thread stopped with signal %d", sig);
         
         if (sig == SIGTRAP) {
-            // Read result
+            // Shellcode completed successfully, read dlclose result
             if (read_remote_memory(tid, result_addr, &dlclose_result, sizeof(dlclose_result))) {
                 LOG_INFO("dlclose returned %lu", dlclose_result);
-                success = (dlclose_result == 0);
+                success = (dlclose_result == 0);  // dlclose returns 0 on success
             } else {
                 LOG_ERR("Failed to read dlclose result");
             }
         } else {
+            // Unexpected signal - dump registers for debugging
             LOG_ERR("Unexpected signal %d during unload", sig);
             Arch::dump_registers(tid, this);
         }
@@ -747,14 +757,14 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         LOG_ERR("Unexpected wait status: %d", status);
     }
     
-    // Restore registers
+    // Restore original registers
     ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs);
     
-    // Free memory
+    // Free remote memory
     remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
     
     if (success) {
-        LOG_INFO("Successfully unloaded library with handle 0x%lx", handle);
+        LOG_DBG("Successfully unloaded library with handle 0x%lx", handle);
     }
     
     return success;
@@ -787,13 +797,18 @@ void DL_Manager::print_library_tracker() const {
 }
 
 bool DL_Manager::unload_library(const std::string& lib_path) {
-    auto it = tracked_libraries_.find(lib_path);
+    // Normalize path for tracker lookup
+    std::string normalized = normalize_path(lib_path);
+    
+    auto it = tracked_libraries_.find(normalized);
     if (it == tracked_libraries_.end()) {
         LOG_ERR("Library %s not found in tracker", lib_path.c_str());
         return false;
     }
     
     TrackedLibrary& lib = it->second;
+    
+    // Safety checks
     if (lib.is_active) {
         LOG_ERR("Cannot unload active library");
         return false;
@@ -803,13 +818,18 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         return false;
     }
     
+    LOG_INFO("Unloading library: %s", lib_path.c_str());
+    
+    // Stop all threads in target process
     std::vector<pid_t> tids = get_all_threads(pid_);
     std::vector<ThreadContext> contexts;
     
     if (!stop_all_threads(tids, contexts)) {
+        LOG_ERR("Failed to stop threads");
         return false;
     }
     
+    // Select worker thread (main thread or first available)
     pid_t worker_tid = pid_;
     bool found = false;
     for (const auto& ctx : contexts) {
@@ -820,25 +840,30 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     }
     if (!found && !contexts.empty()) {
         worker_tid = contexts[0].tid;
-        LOG_INFO("Main thread not found, using thread %d for unload", worker_tid);
+        LOG_DBG("Main thread not found, using thread %d for unload", worker_tid);
     }
     
+    // Prepare worker thread for injection
     struct user_regs_struct prepared_regs;
     if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
         restore_and_detach_all(contexts);
         return false;
     }
     
+#ifdef DEBUG
+    // Verify syscall works before proceeding (debug only)
     if (!test_syscall(worker_tid)) {
         LOG_ERR("Syscall test failed before unload");
         restore_and_detach_all(contexts);
         return false;
     }
+#endif
     
-    LOG_INFO("Calling unload_library_by_handle with handle=0x%lx", lib.handle);
+    LOG_DBG("Calling unload_library_by_handle with handle=0x%lx", lib.handle);
     bool result = unload_library_by_handle(worker_tid, lib.handle, prepared_regs);
     
     if (result) {
+        // Clean up tracker and cache
         invalidate_cache(lib.base_addr);
         tracked_libraries_.erase(it);
         LOG_INFO("Library %s successfully unloaded", lib_path.c_str());
@@ -846,6 +871,7 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         LOG_ERR("Failed to unload library %s", lib_path.c_str());
     }
     
+    // Restore and detach all threads
     restore_and_detach_all(contexts);
     
     return result;
@@ -853,8 +879,7 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
 
 bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uintptr_t old_func,
                               uintptr_t new_func, size_t old_func_size,
-                              const std::string& func_name,
-                              struct user_regs_struct& /*saved_regs*/) {
+                  const std::string& func_name) {
     std::string clean_path = trim(target_lib_path);
     auto lib_it = tracked_libraries_.find(clean_path);
     if (lib_it == tracked_libraries_.end()) {
@@ -863,16 +888,21 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
     }
     TrackedLibrary& target_lib = lib_it->second;
 
+    // Threshold for GOT patching (small functions use GOT)
     const size_t THRESHOLD = 16;
 
+    // GOT patch path - for small functions
     if (old_func_size < THRESHOLD) {
-        LOG_INFO("GOT patch candidate %s (%zu bytes)", func_name.c_str(), old_func_size);
+        LOG_INFO("Patching %s via GOT (function size: %zu bytes)", 
+                 func_name.c_str(), old_func_size);
+        
         uintptr_t got_entry = find_got_entry(target_lib.base_addr, func_name);
         if (got_entry == 0) {
             LOG_WARN("No GOT entry for %s", func_name.c_str());
             return false;
         }
         
+        // Save original GOT value for rollback
         uintptr_t orig = 0;
         if (!read_remote_memory(pid_, got_entry, &orig, sizeof(orig))) {
             LOG_ERR("Cannot read original GOT");
@@ -880,43 +910,54 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
         }
         target_lib.saved_original_got[func_name] = orig;
 
+        // Write new function address to GOT
         if (!write_remote_memory(tid, got_entry, &new_func, sizeof(new_func))) {
             LOG_ERR("GOT write failed");
             return false;
         }
-        LOG_INFO("GOT patched %s -> 0x%lx", func_name.c_str(), new_func);
+        
+        LOG_DBG("GOT patched %s: 0x%lx -> 0x%lx", func_name.c_str(), orig, new_func);
         return true;
     }
 
+    // JMP patch path - for larger functions
     if (old_func_size < 5) {
-        LOG_WARN("Function %s too small (%zu)", func_name.c_str(), old_func_size);
+        LOG_WARN("Function %s too small for JMP patch (%zu bytes)", 
+                 func_name.c_str(), old_func_size);
         return false;
     }
 
+    // Save original bytes for rollback
     uint8_t orig_bytes[5];
     if (!read_remote_memory(pid_, old_func, orig_bytes, 5)) {
-        LOG_ERR("Cannot read original bytes");
+        LOG_ERR("Cannot read original bytes for %s", func_name.c_str());
         return false;
     }
-    target_lib.saved_original_bytes[func_name] = std::vector<uint8_t>(orig_bytes, orig_bytes+5);
+    target_lib.saved_original_bytes[func_name] = 
+        std::vector<uint8_t>(orig_bytes, orig_bytes + 5);
     
+    // Create and write JMP patch
     auto patch = Arch::create_jmp_patch(old_func, new_func);
     if (patch.size() != 5) {
-        LOG_ERR("Unexpected jmp patch size");
+        LOG_ERR("Unexpected jmp patch size for %s", func_name.c_str());
         return false;
     }
+    
     if (!write_remote_memory(tid, old_func, patch.data(), patch.size())) {
-        LOG_ERR("JMP write failed");
+        LOG_ERR("JMP write failed for %s", func_name.c_str());
         return false;
     }
-    LOG_INFO("JMP patched %s -> 0x%lx", func_name.c_str(), new_func);
+    
+    LOG_DBG("JMP patched %s: 0x%lx -> 0x%lx", func_name.c_str(), old_func, new_func);
     return true;
 }
 
-bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path, uintptr_t old_base, uintptr_t new_base,
-                                     const std::string& new_lib_path,
-                                     const std::string& target_function,
-                                     struct user_regs_struct& saved_regs) {
+bool DL_Manager::apply_all_patches(pid_t tid, 
+                                   const std::string& target_lib_path, 
+                                   uintptr_t old_base, 
+                                   uintptr_t new_base, 
+                                   const std::string& new_lib_path, 
+                                   const std::string& target_function) {
     std::string clean_target_path = trim(target_lib_path);
     bool any_success = false;
     int total = 0;
@@ -925,8 +966,9 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
     int failed = 0;
     
     if (target_function == "all") {
+        // Get all exported functions from old library
         auto old_symbols = get_function_symbols(old_base);
-        LOG_INFO("Found %zu functions in old library", old_symbols.size());
+        LOG_INFO("Found %zu exported functions in old library", old_symbols.size());
         
         std::vector<std::string> patched_functions;
         
@@ -934,25 +976,23 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
             total++;
             const std::string& func_name = sym.name;
             
-            // Skip internal C++ symbols (mangled names starting with _Z)
-            if (func_name.size() > 2 && func_name.substr(0, 2) == "_Z") {
-                LOG_DBG("Skipping internal C++ symbol: %s", func_name.c_str());
+            // Get function address in new library
+            uintptr_t new_func_addr = get_symbol_address(new_base, func_name);
+            
+            if (new_func_addr == 0) {
+                LOG_DBG("Function '%s' not exported in new library, skipping", func_name.c_str());
                 skipped++;
                 continue;
             }
             
             uintptr_t old_func_addr = sym.addr;
-            uintptr_t new_func_addr = get_symbol_address(new_base, func_name);
-            if (new_func_addr == 0) {
-                LOG_DBG("Function '%s' not found in new library, skipping", func_name.c_str());
-                skipped++;
-                continue;
-            }
             
+            // Apply patch if addresses differ
             if (old_func_addr != new_func_addr) {
-                LOG_DBG("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
-                        func_name.c_str(), old_func_addr, new_func_addr, sym.size);
-                if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name, saved_regs)) {
+                LOG_INFO("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
+                         func_name.c_str(), old_func_addr, new_func_addr, sym.size);
+                
+                if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name)) {
                     patched_functions.push_back(func_name);
                     succeeded++;
                     any_success = true;
@@ -969,30 +1009,40 @@ bool DL_Manager::apply_all_patches(pid_t tid, const std::string& target_lib_path
         LOG_RESULT("Patching summary: total=%d, succeeded=%d, skipped=%d, failed=%d", 
                    total, succeeded, skipped, failed);
         
+        // Update tracker with patched functions
         if (!patched_functions.empty()) {
             tracked_libraries_[new_lib_path].provided_functions = patched_functions;
         }
         
         return any_success;
+        
     } else {
+        // Patch single function
         uintptr_t old_func = get_symbol_address(old_base, target_function);
         uintptr_t new_func = get_symbol_address(new_base, target_function);
         
-        if (old_func == 0 || new_func == 0) {
-            LOG_ERR("Failed to find target function '%s' in libraries", target_function.c_str());
+        if (old_func == 0) {
+            LOG_ERR("Target function '%s' not exported in old library", target_function.c_str());
+            return false;
+        }
+        
+        if (new_func == 0) {
+            LOG_ERR("Target function '%s' not exported in new library", target_function.c_str());
             return false;
         }
         
         size_t old_size = get_symbol_size(old_base, target_function);
         if (old_size == 0) {
-            LOG_WARN("Could not determine size of function '%s', assuming >=5 bytes", target_function.c_str());
+            LOG_WARN("Could not determine size of function '%s', assuming >=5 bytes", 
+                     target_function.c_str());
             old_size = 5;
         }
         
-        LOG_DBG("Target function at 0x%lx, new at 0x%lx, size=%zu", old_func, new_func, old_size);
+        LOG_DBG("Target function at 0x%lx, new at 0x%lx, size=%zu", 
+                old_func, new_func, old_size);
         
         if (old_func != new_func) {
-            any_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function, saved_regs);
+            any_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function);
             if (any_success) {
                 tracked_libraries_[new_lib_path].provided_functions.push_back(target_function);
             }
@@ -1022,17 +1072,134 @@ bool DL_Manager::check_preconditions(const std::string& target_lib_pattern) {
 bool DL_Manager::ensure_new_library_loaded(pid_t tid, const std::string& new_lib_path,
                                            uintptr_t& new_lib_base, uintptr_t& new_handle,
                                            struct user_regs_struct& saved_regs) {
-    bool already_loaded = is_library_already_loaded(new_lib_path, new_lib_base, new_handle);
-    if (!already_loaded) {
+    std::string normalized = normalize_path(new_lib_path);
+    
+    // Get current file info
+    time_t current_mtime = 0;
+    size_t current_size = 0;
+    bool file_info_ok = get_file_info(new_lib_path, current_mtime, current_size);
+    
+    // Check if library is already loaded in process memory
+    uintptr_t existing_base = 0;
+    bool in_maps = is_library_in_maps(new_lib_path, existing_base);
+    
+    // Check if we have it in tracker
+    auto it = tracked_libraries_.find(normalized);
+    bool in_tracker = (it != tracked_libraries_.end());
+    
+    // Case 1: Not loaded at all - load fresh copy
+    if (!in_maps && !in_tracker) {
+        LOG_INFO("Library not loaded, loading fresh copy");
         new_lib_base = load_new_library(tid, new_lib_path, new_handle, saved_regs);
         if (new_lib_base == 0) return false;
         
-        tracked_libraries_[new_lib_path] = TrackedLibrary(new_lib_path, new_handle, new_lib_base, "");
-        LOG_INFO("New library added to tracker");
-    } else {
-        LOG_INFO("Library already loaded, using existing copy.");
+        TrackedLibrary& lib = tracked_libraries_[normalized];
+        lib = TrackedLibrary(normalized, new_handle, new_lib_base, "");
+        // Store file info even if get_file_info failed (store 0)
+        lib.mtime = file_info_ok ? current_mtime : 0;
+        lib.file_size = file_info_ok ? current_size : 0;
+        return true;
     }
-    return true;
+    
+    // Case 2: In tracker - check if file changed
+    if (in_tracker) {
+        TrackedLibrary& lib = it->second;
+        
+        // Check if file has changed using mtime and size
+        bool file_changed = false;
+        if (file_info_ok && lib.file_size != 0) {
+            file_changed = (lib.mtime != current_mtime) || (lib.file_size != current_size);
+            if (file_changed) {
+                LOG_DBG("File changed: mtime %ld->%ld, size %zu->%zu", 
+                        lib.mtime, current_mtime, lib.file_size, current_size);
+            }
+        } else if (file_info_ok && lib.file_size == 0) {
+            // First time we have valid file info - store it but don't treat as change
+            lib.mtime = current_mtime;
+            lib.file_size = current_size;
+            file_changed = false;
+        }
+        
+        if (!file_changed) {
+            // Same file, use existing
+            LOG_INFO("Library already loaded and unchanged, using existing copy");
+            new_lib_base = lib.base_addr;
+            new_handle = lib.handle;
+            return true;
+        } else {
+            // File changed, need to reload
+            LOG_INFO("Library file changed, reloading");
+            
+            // If it's active, we can't unload it now
+            if (lib.is_active) {
+                LOG_ERR("Cannot reload active library - file changed but library is in use");
+                LOG_ERR("Please replace it with a different name first, then unload old version");
+                return false;
+            }
+            
+            // Unload old version
+            if (lib.handle != 0) {
+                if (!unload_library_by_handle(tid, lib.handle, saved_regs)) {
+                    LOG_WARN("Failed to unload old version, but continuing with new load");
+                }
+            }
+            
+            // Load new version
+            new_lib_base = load_new_library(tid, new_lib_path, new_handle, saved_regs);
+            if (new_lib_base == 0) return false;
+            
+            // Update tracker
+            lib.handle = new_handle;
+            lib.base_addr = new_lib_base;
+            lib.provided_functions.clear(); // Will be repopulated during patching
+            if (file_info_ok) {
+                lib.mtime = current_mtime;
+                lib.file_size = current_size;
+            }
+            
+            LOG_INFO("Library reloaded successfully");
+            return true;
+        }
+    }
+    
+    // Case 3: In maps but not in tracker (loaded by process itself)
+    if (in_maps && !in_tracker) {
+        LOG_INFO("Library loaded by process but not tracked, loading our copy");
+        
+        // Load our own copy to get handle
+        new_lib_base = load_new_library(tid, new_lib_path, new_handle, saved_regs);
+        if (new_lib_base == 0) return false;
+        
+        TrackedLibrary& lib = tracked_libraries_[normalized];
+        lib = TrackedLibrary(normalized, new_handle, new_lib_base, "");
+        if (file_info_ok) {
+            lib.mtime = current_mtime;
+            lib.file_size = current_size;
+        }
+        
+        LOG_INFO("Library loaded and tracked");
+        return true;
+    }
+    
+    return false;
+}
+
+bool DL_Manager::is_library_in_maps(const std::string& lib_path, uintptr_t& base_addr) const {
+    std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
+    std::ifstream maps_file(maps_path);
+    if (!maps_file.is_open()) return false;
+    
+    std::string line;
+    while (std::getline(maps_file, line)) {
+        if (line.find(lib_path) != std::string::npos) {
+            size_t dash = line.find('-');
+            if (dash != std::string::npos) {
+                base_addr = std::stoul(line.substr(0, dash), nullptr, 16);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool DL_Manager::wait_for_threads_to_leave_library(const std::vector<pid_t>& all_tids,
@@ -1122,15 +1289,17 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
                                         struct user_regs_struct& saved_regs) {
     LOG_DBG("Cleaning up old libraries...");
     
-    struct user_regs_struct prepared_regs = saved_regs; 
+    // These paths should already be normalized when passed in
+    std::string normalized_target = target_lib_path;
+    std::string normalized_new = new_lib_path;
     
     std::set<std::string> to_unload;
     for (const auto& pair : tracked_libraries_) {
         const TrackedLibrary& lib = pair.second;
-        if (lib.path == new_lib_path) continue;
-        if (lib.path == target_lib_path && lib.is_original) continue;
+        if (lib.path == normalized_new) continue;               // Skip the new library
+        if (lib.path == normalized_target && lib.is_original) continue; // Skip original target
         if (!lib.is_active && !lib.is_original) {
-            to_unload.insert(lib.path);
+            to_unload.insert(pair.first); // Use normalized path from tracker
         }
     }
     
@@ -1139,9 +1308,7 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
         if (it != tracked_libraries_.end() && it->second.handle != 0) {
             LOG_INFO("Unloading unused library: %s", path.c_str());
             
-            struct user_regs_struct current_prepared = prepared_regs;
-            
-            if (unload_library_by_handle(tid, it->second.handle, current_prepared)) {
+            if (unload_library_by_handle(tid, it->second.handle, saved_regs)) {
                 invalidate_cache(it->second.base_addr);
                 tracked_libraries_.erase(it);
             } else {
@@ -1159,25 +1326,55 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     LOG_RESULT("New: %s", new_lib_path.c_str());
     LOG_RESULT("Function: %s", target_function.c_str());
 
+    // Check required addresses
     if (dlopen_addr_ == 0 || dlclose_addr_ == 0 || syscall_insn_ == 0) {
         LOG_ERR("Required addresses not initialized");
         LOG_RESULT("=== Library replacement failed ===");
         return false;
     }
 
+    // Get information about target library from /proc/pid/maps
     LibraryInfo target_info = get_library_info(target_lib_pattern);
     if (target_info.base_addr == 0) {
-        LOG_ERR("Target library not found");
+        LOG_ERR("Target library not found in process memory");
         LOG_RESULT("=== Library replacement failed ===");
         return false;
     }
 
     std::string clean_target_path = trim(target_info.path);
     
-    auto target_it = tracked_libraries_.find(clean_target_path);
+    // Normalize paths for consistent tracker storage
+    std::string normalized_target = normalize_path(clean_target_path);
+    std::string normalized_new = normalize_path(new_lib_path);
+    
+    // Get current file info for change detection (using mtime and size only)
+    time_t target_mtime = 0, new_mtime = 0;
+    size_t target_size = 0, new_size = 0;
+    bool target_info_ok = get_file_info(clean_target_path, target_mtime, target_size);
+    get_file_info(new_lib_path, new_mtime, new_size);
+
+    // Check if target is in tracker
+    auto target_it = tracked_libraries_.find(normalized_target);
     if (target_it != tracked_libraries_.end()) {
         TrackedLibrary& target_lib = target_it->second;
         
+        // Check if target file has changed since last load (using mtime and size)
+        if (target_info_ok && target_lib.file_size != 0) {
+            bool target_changed = (target_lib.mtime != target_mtime) ||
+                                  (target_lib.file_size != target_size);
+            if (target_changed) {
+                LOG_WARN("Target library file has changed on disk since last load");
+                // Update stored info
+                target_lib.mtime = target_mtime;
+                target_lib.file_size = target_size;
+            }
+        } else if (target_info_ok && target_lib.file_size == 0) {
+            // First time we have valid file info
+            target_lib.mtime = target_mtime;
+            target_lib.file_size = target_size;
+        }
+        
+        // Check if target is active and non-original (cannot replace)
         if (target_lib.is_active && !target_lib.is_original) {
             LOG_ERR("Cannot replace active non-original library. Target library is currently in use.");
             LOG_ERR("Use rollback first or unload it before replacement.");
@@ -1192,33 +1389,43 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("Target library not in tracker - assuming it's safe to replace");
     }
 
-    if (tracked_libraries_.find(clean_target_path) == tracked_libraries_.end()) {
-        TrackedLibrary target_lib(clean_target_path, 0, target_info.base_addr, std::vector<std::string>());
+    // Add target to tracker if not already there
+    if (tracked_libraries_.find(normalized_target) == tracked_libraries_.end()) {
+        TrackedLibrary target_lib(normalized_target, 0, target_info.base_addr, std::vector<std::string>());
         target_lib.is_original = true;
-        tracked_libraries_[clean_target_path] = target_lib;
+        
+        // Store file info, even if get_file_info failed (store 0)
+        target_lib.mtime = target_info_ok ? target_mtime : 0;
+        target_lib.file_size = target_info_ok ? target_size : 0;
+        
+        tracked_libraries_[normalized_target] = target_lib;
         LOG_INFO("Added target library to tracker: %s", clean_target_path.c_str());
     }
 
-    if (new_lib_path == target_info.path) {
+    // Check if new library is the same file as target (comparing by path only)
+    if (normalized_new == normalized_target) {
         LOG_INFO("New library is the same as target, nothing to do.");
         LOG_RESULT("=== Library replacement skipped (same library) ===");
         return true;
     }
 
+    // Get all threads in target process
     std::vector<pid_t> all_tids = get_all_threads(pid_);
     if (all_tids.empty()) {
-        LOG_ERR("No threads found");
+        LOG_ERR("No threads found - process may have terminated");
         return false;
     }
 
     const int MAX_ATTEMPTS = 50;
     const int RETRY_US = 10000;
 
+    // Stop all threads and ensure they're outside target library
     std::vector<ThreadContext> contexts;
     bool freeze_success = false;
 
     for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
         if (!stop_all_threads(all_tids, contexts)) {
+            LOG_ERR("Failed to stop threads on attempt %d", attempt + 1);
             return false;
         }
 
@@ -1237,6 +1444,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
+    // Select worker thread (main thread or first available)
     pid_t worker_tid = pid_;
     ThreadContext worker_ctx;
     bool found = false;
@@ -1253,6 +1461,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
     }
 
+    // Prepare worker thread for injection (move out of syscalls)
     struct user_regs_struct prepared_regs;
     if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
         restore_and_detach_all(contexts);
@@ -1265,34 +1474,47 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
 
     struct user_regs_struct saved_regs = prepared_regs;
 
+    // Verify syscall works before proceeding
     if (!test_syscall(worker_tid)) {
         LOG_ERR("Syscall test failed");
         restore_and_detach_all(contexts);
         return false;
     }
 
+    // Load new library (will handle reloading if file changed)
     uintptr_t new_lib_base = 0, new_handle = 0;
-    if (!ensure_new_library_loaded(worker_tid, new_lib_path, new_lib_base, new_handle, saved_regs)) {
+    if (!ensure_new_library_loaded(worker_tid, normalized_new, new_lib_base, new_handle, saved_regs)) {
         LOG_ERR("Failed to load new library");
         restore_and_detach_all(contexts);
         return false;
     }
 
-    bool patch_success = apply_all_patches(worker_tid, clean_target_path, target_info.base_addr, new_lib_base,
-                                           new_lib_path, target_function, saved_regs);
+    // Apply patches
+    bool patch_success = apply_all_patches(worker_tid, normalized_target, target_info.base_addr, new_lib_base,
+                                           normalized_new, target_function);
 
     if (patch_success) {
+        // Update active status in tracker
         for (auto& pair : tracked_libraries_) {
-            if (pair.first != new_lib_path) pair.second.is_active = false;
+            if (pair.first != normalized_new) pair.second.is_active = false;
         }
-        tracked_libraries_[new_lib_path].is_active = true;
-        tracked_libraries_[new_lib_path].patched_libraries.push_back(target_info.path);
         
-        cleanup_old_libraries(clean_target_path, new_lib_path, worker_tid, saved_regs);
+        auto new_lib_it = tracked_libraries_.find(normalized_new);
+        if (new_lib_it != tracked_libraries_.end()) {
+            new_lib_it->second.is_active = true;
+            new_lib_it->second.patched_libraries.push_back(target_info.path);
+        }
         
-        // Start cleanup daemon if not running
-        if (!Daemon::is_running()) {
-            Daemon::start();
+        // Clean up old, unused libraries
+        cleanup_old_libraries(normalized_target, normalized_new, worker_tid, saved_regs);
+        
+        // Start cleanup daemon if not running (first successful replacement)
+        static bool daemon_started = false;
+        if (!daemon_started) {
+            if (!Daemon::is_running()) {
+                Daemon::start();
+            }
+            daemon_started = true;
         }
         
         LOG_RESULT("=== Library replacement completed successfully ===");
@@ -1300,6 +1522,8 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_RESULT("=== Library replacement failed ===");
     }
 
+    // Restore registers for all threads and detach
     restore_and_detach_all(contexts);
+    
     return patch_success;
 }

@@ -16,6 +16,30 @@ static inline std::string trim(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+// Helper to normalize library paths (convert to absolute)
+static std::string normalize_path(const std::string& path) {
+    if (path.empty()) return path;
+    if (path[0] == '/') return path; // Already absolute
+    
+    // Convert relative to absolute using current working directory
+    char* cwd = getcwd(nullptr, 0);
+    if (!cwd) return path;
+    
+    std::string result = std::string(cwd) + "/" + path;
+    free(cwd);
+    return result;
+}
+
+static bool get_file_info(const std::string& path, time_t& mtime, size_t& size) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    mtime = st.st_mtime;
+    size = st.st_size;
+    return true;
+}
+
 // Functions for reading process memory
 static bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size) {
     struct iovec local = {buffer, size};

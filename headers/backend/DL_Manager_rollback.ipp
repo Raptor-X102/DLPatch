@@ -40,15 +40,21 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
     }
 
     if (all_ok) {
+        bool had_patches = (lib.saved_original_got.size() > 0 || 
+                            lib.saved_original_bytes.size() > 0);
+        
         lib.saved_original_got.clear();
         lib.saved_original_bytes.clear();
-        // Make this library active and deactivate all others
-        for (auto& [path, l] : tracked_libraries_) {
-            l.is_active = (path == lib_path);
+        
+        if (had_patches) {
+            // Only change activity if we actually restored something
+            for (auto& [path, l] : tracked_libraries_) {
+                l.is_active = (path == lib_path);
+            }
+            LOG_INFO("Rolled back all patches for %s", lib_path.c_str());
+        } else {
+            LOG_INFO("No patches found for %s, nothing to rollback", lib_path.c_str());
         }
-        LOG_INFO("Rolled back all patches for %s", lib_path.c_str());
-    } else {
-        LOG_WARN("Partial rollback for %s", lib_path.c_str());
     }
 
     resume_all_threads(tids);
