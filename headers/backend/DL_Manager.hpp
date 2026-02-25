@@ -45,12 +45,14 @@ struct TrackedLibrary {
     time_t mtime;     // File modification time
     size_t file_size; // File size
 
-    // Constructors
+        // Constructors
     TrackedLibrary()
         : handle(0)
         , base_addr(0)
         , is_active(false)
-        , is_original(false) {}
+        , is_original(false)
+        , mtime(0)           // Явно инициализируем нулем
+        , file_size(0) {}    // Явно инициализируем нулем
 
     TrackedLibrary(const std::string &p,
                    uintptr_t h,
@@ -60,7 +62,9 @@ struct TrackedLibrary {
         , handle(h)
         , base_addr(addr)
         , is_active(false)
-        , is_original(false) {
+        , is_original(false)
+        , mtime(0)           // Явно инициализируем нулем
+        , file_size(0) {     // Явно инициализируем нулем
         provided_functions.push_back(func);
     }
 
@@ -73,7 +77,9 @@ struct TrackedLibrary {
         , base_addr(addr)
         , provided_functions(functions)
         , is_active(false)
-        , is_original(false) {}
+        , is_original(false)
+        , mtime(0)           // Явно инициализируем нулем
+        , file_size(0) {}    // Явно инициализируем нулем
 };
 
 // Symbol information
@@ -107,6 +113,12 @@ struct DynamicInfo {
     size_t syment = 0;        // DT_SYMENT - size of symbol table entry
     uintptr_t hash = 0;       // DT_HASH - ELF hash table
     uintptr_t gnu_hash = 0;   // DT_GNU_HASH - GNU hash table
+};
+
+enum class LoadResult {
+    LOADED_NEW,        // Loaded new copy of library
+    USED_EXISTING,     // Using existing (library was not changed)
+    FAILED             // Loading failed
 };
 
 //=============================================================================
@@ -337,11 +349,11 @@ private:
                            const std::string &target_function);
 
     bool check_preconditions(const std::string &target_lib_pattern);
-    bool ensure_new_library_loaded(pid_t tid,
-                                   const std::string &new_lib_path,
-                                   uintptr_t &new_lib_base,
-                                   uintptr_t &new_handle,
-                                   struct user_regs_struct &saved_regs);
+    LoadResult ensure_new_library_loaded(pid_t tid,
+                                         const std::string& new_lib_path,
+                                         uintptr_t& new_lib_base,
+                                         uintptr_t& new_handle,
+                                         struct user_regs_struct& saved_regs);
 
     //-------------------------------------------------------------------------
     // Cache methods (DL_Manager_cache.ipp)

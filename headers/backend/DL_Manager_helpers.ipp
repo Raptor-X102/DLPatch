@@ -30,13 +30,16 @@ static std::string normalize_path(const std::string& path) {
     return result;
 }
 
+// Get file info with debug logging
 static bool get_file_info(const std::string& path, time_t& mtime, size_t& size) {
     struct stat st;
     if (stat(path.c_str(), &st) != 0) {
+        LOG_DBG("stat failed for %s: %s", path.c_str(), strerror(errno));
         return false;
     }
     mtime = st.st_mtime;
     size = st.st_size;
+    LOG_DBG("File info for %s: mtime=%ld, size=%zu", path.c_str(), mtime, size);
     return true;
 }
 
