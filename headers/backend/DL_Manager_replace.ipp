@@ -21,6 +21,61 @@ static const size_t REMOTE_MEM_SIZE = 4096;
 static const size_t SHELLCODE_PATH_OFFSET = 256;
 static const size_t SHELLCODE_RESULT_OFFSET = 512;
 
+//=============================================================================
+// Static helper functions 
+//=============================================================================
+
+static void log_replacement_start(const std::string& target, const std::string& new_lib, const std::string& function) {
+    LOG_RESULT("=== Starting library replacement ===");
+    LOG_RESULT("Target pattern: %s", target.c_str());
+    LOG_RESULT("New: %s", new_lib.c_str());
+    LOG_RESULT("Function: %s", function.c_str());
+}
+
+static void log_replacement_result(bool success) {
+    if (success) {
+        LOG_RESULT("=== Library replacement completed successfully ===");
+    } else {
+        LOG_RESULT("=== Library replacement failed ===");
+    }
+}
+
+static bool check_required_addresses(uintptr_t dlopen_addr, uintptr_t dlclose_addr, uintptr_t syscall_insn) {
+    if (dlopen_addr == 0 || dlclose_addr == 0 || syscall_insn == 0) {
+        LOG_ERR("Required addresses not initialized");
+        return false;
+    }
+    return true;
+}
+
+// Update file info in tracker if it changed on disk
+static void update_tracked_file_info(TrackedLibrary& lib, time_t mtime, size_t size, bool info_ok) {
+    if (!info_ok) return;
+    
+    if (lib.file_size != 0) {
+        bool changed = (lib.mtime != mtime) || (lib.file_size != size);
+        if (changed) {
+            LOG_WARN("Library file has changed on disk since last load");
+            lib.mtime = mtime;
+            lib.file_size = size;
+        }
+    } else {
+        // First time we have valid file info
+        lib.mtime = mtime;
+        lib.file_size = size;
+    }
+}
+
+// Start cleanup daemon on first successful patch
+static void ensure_daemon_running() {
+    static bool daemon_started = false;
+    if (!daemon_started) {
+        if (!Daemon::is_running()) {
+            Daemon::start();
+        }
+        daemon_started = true;
+    }
+}
 static bool stop_all_threads(const std::vector<pid_t>& tids, std::vector<ThreadContext>& contexts) {
     contexts.clear();
     for (pid_t tid : tids) {
@@ -1318,110 +1373,78 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
     }
 }
 
-bool DL_Manager::replace_library(const std::string& target_lib_pattern,
-                                  const std::string& new_lib_path,
-                                  const std::string& target_function) {
-    LOG_RESULT("=== Starting library replacement ===");
-    LOG_RESULT("Target pattern: %s", target_lib_pattern.c_str());
-    LOG_RESULT("New: %s", new_lib_path.c_str());
-    LOG_RESULT("Function: %s", target_function.c_str());
-
-    // Check required addresses
-    if (dlopen_addr_ == 0 || dlclose_addr_ == 0 || syscall_insn_ == 0) {
-        LOG_ERR("Required addresses not initialized");
-        LOG_RESULT("=== Library replacement failed ===");
-        return false;
-    }
-
-    // Get information about target library from /proc/pid/maps
-    LibraryInfo target_info = get_library_info(target_lib_pattern);
+bool DL_Manager::validate_target_library(const std::string& target_lib_pattern, 
+                                          LibraryInfo& target_info,
+                                          std::string& clean_path,
+                                          std::string& normalized_path) {
+    // Get target library info from /proc/pid/maps
+    target_info = get_library_info(target_lib_pattern);
     if (target_info.base_addr == 0) {
         LOG_ERR("Target library not found in process memory");
-        LOG_RESULT("=== Library replacement failed ===");
         return false;
     }
 
-    std::string clean_target_path = trim(target_info.path);
-    
-    // Normalize paths for consistent tracker storage
-    std::string normalized_target = normalize_path(clean_target_path);
-    std::string normalized_new = normalize_path(new_lib_path);
-    
-    // Get current file info for change detection (using mtime and size only)
-    time_t target_mtime = 0, new_mtime = 0;
-    size_t target_size = 0, new_size = 0;
-    bool target_info_ok = get_file_info(clean_target_path, target_mtime, target_size);
-    get_file_info(new_lib_path, new_mtime, new_size);
+    clean_path = trim(target_info.path);
+    normalized_path = normalize_path(clean_path);
+    return true;
+}
 
-    // Check if target is in tracker
+bool DL_Manager::check_target_safety(const std::string& normalized_target,
+                                      time_t target_mtime,
+                                      size_t target_size,
+                                      bool target_info_ok) {
     auto target_it = tracked_libraries_.find(normalized_target);
-    if (target_it != tracked_libraries_.end()) {
-        TrackedLibrary& target_lib = target_it->second;
-        
-        // Check if target file has changed since last load (using mtime and size)
-        if (target_info_ok && target_lib.file_size != 0) {
-            bool target_changed = (target_lib.mtime != target_mtime) ||
-                                  (target_lib.file_size != target_size);
-            if (target_changed) {
-                LOG_WARN("Target library file has changed on disk since last load");
-                // Update stored info
-                target_lib.mtime = target_mtime;
-                target_lib.file_size = target_size;
-            }
-        } else if (target_info_ok && target_lib.file_size == 0) {
-            // First time we have valid file info
-            target_lib.mtime = target_mtime;
-            target_lib.file_size = target_size;
-        }
-        
-        // Check if target is active and non-original (cannot replace)
-        if (target_lib.is_active && !target_lib.is_original) {
-            LOG_ERR("Cannot replace active non-original library. Target library is currently in use.");
-            LOG_ERR("Use rollback first or unload it before replacement.");
-            LOG_RESULT("=== Library replacement failed (target is active and not original) ===");
-            return false;
-        }
-        
-        if (target_lib.is_original) {
-            LOG_INFO("Target is original library - replacement allowed");
-        }
-    } else {
+    if (target_it == tracked_libraries_.end()) {
+        // Library not in tracker - safe to replace
         LOG_INFO("Target library not in tracker - assuming it's safe to replace");
-    }
-
-    // Add target to tracker if not already there
-    if (tracked_libraries_.find(normalized_target) == tracked_libraries_.end()) {
-        TrackedLibrary target_lib(normalized_target, 0, target_info.base_addr, std::vector<std::string>());
-        target_lib.is_original = true;
-        
-        // Store file info, even if get_file_info failed (store 0)
-        target_lib.mtime = target_info_ok ? target_mtime : 0;
-        target_lib.file_size = target_info_ok ? target_size : 0;
-        
-        tracked_libraries_[normalized_target] = target_lib;
-        LOG_INFO("Added target library to tracker: %s", clean_target_path.c_str());
-    }
-
-    // Check if new library is the same file as target (comparing by path only)
-    if (normalized_new == normalized_target) {
-        LOG_INFO("New library is the same as target, nothing to do.");
-        LOG_RESULT("=== Library replacement skipped (same library) ===");
         return true;
     }
 
-    // Get all threads in target process
-    std::vector<pid_t> all_tids = get_all_threads(pid_);
-    if (all_tids.empty()) {
-        LOG_ERR("No threads found - process may have terminated");
+    TrackedLibrary& target_lib = target_it->second;
+    
+    // Update file info if changed
+    update_tracked_file_info(target_lib, target_mtime, target_size, target_info_ok);
+    
+    // Cannot replace active non-original library
+    if (target_lib.is_active && !target_lib.is_original) {
+        LOG_ERR("Cannot replace active non-original library. Target library is currently in use.");
+        LOG_ERR("Use rollback first or unload it before replacement.");
         return false;
     }
+    
+    if (target_lib.is_original) {
+        LOG_INFO("Target is original library - replacement allowed");
+    }
+    
+    return true;
+}
 
+void DL_Manager::ensure_target_in_tracker(const std::string& normalized_target,
+                                           const std::string& clean_path,
+                                           uintptr_t target_base,
+                                           time_t target_mtime,
+                                           size_t target_size,
+                                           bool target_info_ok) {
+    // Skip if already tracked
+    if (tracked_libraries_.find(normalized_target) != tracked_libraries_.end()) {
+        return;
+    }
+    
+    // Add as original library
+    TrackedLibrary target_lib(normalized_target, 0, target_base, std::vector<std::string>());
+    target_lib.is_original = true;
+    target_lib.mtime = target_info_ok ? target_mtime : 0;
+    target_lib.file_size = target_info_ok ? target_size : 0;
+    
+    tracked_libraries_[normalized_target] = target_lib;
+    LOG_INFO("Added target library to tracker: %s", clean_path.c_str());
+}
+
+bool DL_Manager::freeze_threads_outside_library(const std::vector<pid_t>& all_tids,
+                                                 const std::vector<std::pair<uintptr_t, uintptr_t>>& segments,
+                                                 std::vector<ThreadContext>& contexts) {
     const int MAX_ATTEMPTS = 50;
     const int RETRY_US = 10000;
-
-    // Stop all threads and ensure they're outside target library
-    std::vector<ThreadContext> contexts;
-    bool freeze_success = false;
 
     for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
         if (!stop_all_threads(all_tids, contexts)) {
@@ -1429,101 +1452,168 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
             return false;
         }
 
-        if (all_threads_outside(contexts, target_info.segments)) {
-            freeze_success = true;
-            break;
+        // Check if all threads are outside the library
+        if (all_threads_outside(contexts, segments)) {
+            return true;
         }
 
+        // Still inside - detach and retry
         restore_and_detach_all(contexts);
         contexts.clear();
         usleep(RETRY_US);
     }
 
-    if (!freeze_success) {
-        LOG_ERR("Failed to freeze all threads outside the library after %d attempts", MAX_ATTEMPTS);
+    LOG_ERR("Failed to freeze all threads outside the library after %d attempts", MAX_ATTEMPTS);
+    return false;
+}
+
+void DL_Manager::select_worker_thread(const std::vector<ThreadContext>& contexts, pid_t& worker_tid) {
+    // Prefer main thread (pid_)
+    for (const auto& ctx : contexts) {
+        if (ctx.tid == pid_) {
+            worker_tid = ctx.tid;
+            return;
+        }
+    }
+    
+    // Fallback to first available thread
+    worker_tid = contexts[0].tid;
+    LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
+}
+
+void DL_Manager::update_active_status(const std::string& normalized_new) {
+    // Only the new library remains active
+    for (auto& pair : tracked_libraries_) {
+        pair.second.is_active = (pair.first == normalized_new);
+    }
+}
+
+void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& target_path) {
+    auto new_lib_it = tracked_libraries_.find(normalized_new);
+    if (new_lib_it != tracked_libraries_.end()) {
+        new_lib_it->second.is_active = true;
+        new_lib_it->second.patched_libraries.push_back(target_path);
+    }
+}
+
+//=============================================================================
+// Main replacement function 
+//=============================================================================
+bool DL_Manager::replace_library(const std::string& target_lib_pattern,
+                                  const std::string& new_lib_path,
+                                  const std::string& target_function) {
+    log_replacement_start(target_lib_pattern, new_lib_path, target_function);
+
+    // Check required addresses
+    if (!check_required_addresses(dlopen_addr_, dlclose_addr_, syscall_insn_)) {
+        log_replacement_result(false);
         return false;
     }
 
-    // Select worker thread (main thread or first available)
-    pid_t worker_tid = pid_;
-    ThreadContext worker_ctx;
-    bool found = false;
-    for (const auto& ctx : contexts) {
-        if (ctx.tid == worker_tid) {
-            worker_ctx = ctx;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        worker_tid = contexts[0].tid;
-        worker_ctx = contexts[0];
-        LOG_INFO("Main thread not found, using thread %d for injection", worker_tid);
+    // Validate target library
+    LibraryInfo target_info;
+    std::string clean_target_path, normalized_target;
+    if (!validate_target_library(target_lib_pattern, target_info, clean_target_path, normalized_target)) {
+        log_replacement_result(false);
+        return false;
     }
 
-    // Prepare worker thread for injection (move out of syscalls)
+    // Normalize new library path
+    std::string normalized_new = normalize_path(new_lib_path);
+
+    // Get file info for change detection
+    time_t target_mtime = 0, new_mtime = 0;
+    size_t target_size = 0, new_size = 0;
+    bool target_info_ok = get_file_info(clean_target_path, target_mtime, target_size);
+    get_file_info(new_lib_path, new_mtime, new_size);
+
+    // Check if target is safe to replace
+    if (!check_target_safety(normalized_target, target_mtime, target_size, target_info_ok)) {
+        log_replacement_result(false);
+        return false;
+    }
+
+    // Ensure target is in tracker
+    ensure_target_in_tracker(normalized_target, clean_target_path, target_info.base_addr,
+                             target_mtime, target_size, target_info_ok);
+
+    // Check if new library is the same as target
+    if (normalized_new == normalized_target) {
+        LOG_INFO("New library is the same as target, nothing to do.");
+        log_replacement_result(true);
+        return true;
+    }
+
+    // Get all threads
+    std::vector<pid_t> all_tids = get_all_threads(pid_);
+    if (all_tids.empty()) {
+        LOG_ERR("No threads found - process may have terminated");
+        log_replacement_result(false);
+        return false;
+    }
+
+    // Freeze threads outside target library
+    std::vector<ThreadContext> contexts;
+    if (!freeze_threads_outside_library(all_tids, target_info.segments, contexts)) {
+        log_replacement_result(false);
+        return false;
+    }
+
+    // Select worker thread
+    pid_t worker_tid;
+    select_worker_thread(contexts, worker_tid);
+
+    // Prepare worker thread for injection
     struct user_regs_struct prepared_regs;
     if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
         restore_and_detach_all(contexts);
+        log_replacement_result(false);
         return false;
     }
 
     LOG_DBG("Prepared IP=0x%llx, SP=0x%llx", 
-             (unsigned long long)Arch::get_ip(prepared_regs), 
-             (unsigned long long)Arch::get_sp(prepared_regs));
+            (unsigned long long)Arch::get_ip(prepared_regs), 
+            (unsigned long long)Arch::get_sp(prepared_regs));
 
     struct user_regs_struct saved_regs = prepared_regs;
 
-    // Verify syscall works before proceeding
+    // Verify syscall works
     if (!test_syscall(worker_tid)) {
         LOG_ERR("Syscall test failed");
         restore_and_detach_all(contexts);
+        log_replacement_result(false);
         return false;
     }
 
-    // Load new library (will handle reloading if file changed)
+    // Load new library
     uintptr_t new_lib_base = 0, new_handle = 0;
     if (!ensure_new_library_loaded(worker_tid, normalized_new, new_lib_base, new_handle, saved_regs)) {
         LOG_ERR("Failed to load new library");
         restore_and_detach_all(contexts);
+        log_replacement_result(false);
         return false;
     }
 
     // Apply patches
-    bool patch_success = apply_all_patches(worker_tid, normalized_target, target_info.base_addr, new_lib_base,
+    bool patch_success = apply_all_patches(worker_tid, normalized_target, 
+                                           target_info.base_addr, new_lib_base,
                                            normalized_new, target_function);
 
     if (patch_success) {
-        // Update active status in tracker
-        for (auto& pair : tracked_libraries_) {
-            if (pair.first != normalized_new) pair.second.is_active = false;
-        }
+        // Update tracker state
+        update_active_status(normalized_new);
+        record_patched_library(normalized_new, target_info.path);
         
-        auto new_lib_it = tracked_libraries_.find(normalized_new);
-        if (new_lib_it != tracked_libraries_.end()) {
-            new_lib_it->second.is_active = true;
-            new_lib_it->second.patched_libraries.push_back(target_info.path);
-        }
-        
-        // Clean up old, unused libraries
+        // Clean up old libraries
         cleanup_old_libraries(normalized_target, normalized_new, worker_tid, saved_regs);
         
-        // Start cleanup daemon if not running (first successful replacement)
-        static bool daemon_started = false;
-        if (!daemon_started) {
-            if (!Daemon::is_running()) {
-                Daemon::start();
-            }
-            daemon_started = true;
-        }
-        
-        LOG_RESULT("=== Library replacement completed successfully ===");
-    } else {
-        LOG_RESULT("=== Library replacement failed ===");
+        // Start daemon if needed
+        ensure_daemon_running();
     }
 
-    // Restore registers for all threads and detach
+    // Restore registers and detach all threads
     restore_and_detach_all(contexts);
     
+    log_replacement_result(patch_success);
     return patch_success;
 }

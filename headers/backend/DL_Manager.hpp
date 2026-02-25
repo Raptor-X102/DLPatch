@@ -170,6 +170,33 @@ public:
     //-------------------------------------------------------------------------
     // Main patching interface (DL_Manager_replace.ipp)
     //-------------------------------------------------------------------------
+    bool validate_target_library(const std::string& target_lib_pattern, 
+                                  LibraryInfo& target_info,
+                                  std::string& clean_path,
+                                  std::string& normalized_path);
+    
+    bool check_target_safety(const std::string& normalized_target,
+                              time_t target_mtime,
+                              size_t target_size,
+                              bool target_info_ok);
+    
+    void ensure_target_in_tracker(const std::string& normalized_target,
+                                   const std::string& clean_path,
+                                   uintptr_t target_base,
+                                   time_t target_mtime,
+                                   size_t target_size,
+                                   bool target_info_ok);
+    
+    bool freeze_threads_outside_library(const std::vector<pid_t>& all_tids,
+                                         const std::vector<std::pair<uintptr_t, uintptr_t>>& segments,
+                                         std::vector<ThreadContext>& contexts);
+    
+    void select_worker_thread(const std::vector<ThreadContext>& contexts, pid_t& worker_tid);
+    
+    void update_active_status(const std::string& normalized_new);
+    
+    void record_patched_library(const std::string& normalized_new, const std::string& target_path);
+
     bool replace_library(
         const std::string &target_lib_pattern,
         const std::string &new_lib_path,
