@@ -388,6 +388,36 @@ bool DL_Manager::is_library_active(const std::string& lib_path) const {
     return it->second.is_active;
 }
 
+void DL_Manager::update_active_status(const std::string& original_path, const std::string& new_path) {
+    // Deactivate original library
+    auto orig_it = tracked_libraries_.find(original_path);
+    if (orig_it != tracked_libraries_.end()) {
+        orig_it->second.is_active = false;
+        LOG_DBG("Original library deactivated: %s", original_path.c_str());
+    }
+    
+    // Activate new library
+    auto new_it = tracked_libraries_.find(new_path);
+    if (new_it != tracked_libraries_.end()) {
+        new_it->second.is_active = true;
+        LOG_DBG("New library activated: %s", new_path.c_str());
+    }
+}
+
+void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& target_path) {
+    auto new_lib_it = tracked_libraries_.find(normalized_new);
+    if (new_lib_it != tracked_libraries_.end()) {
+        // is_active already set in update_active_status
+        // Add target to patched_libraries list if not already there
+        if (std::find(new_lib_it->second.patched_libraries.begin(), 
+                     new_lib_it->second.patched_libraries.end(), 
+                     target_path) == new_lib_it->second.patched_libraries.end()) {
+            new_lib_it->second.patched_libraries.push_back(target_path);
+            LOG_DBG("Recorded patched library %s for %s", target_path.c_str(), normalized_new.c_str());
+        }
+    }
+}
+
 bool DL_Manager::test_syscall(pid_t tid) {
     if (syscall_insn_ == 0) return false;
     
@@ -1654,14 +1684,6 @@ void DL_Manager::update_active_status(const std::string& normalized_new) {
     }
 }
 
-void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& target_path) {
-    auto new_lib_it = tracked_libraries_.find(normalized_new);
-    if (new_lib_it != tracked_libraries_.end()) {
-        new_lib_it->second.is_active = true;
-        new_lib_it->second.patched_libraries.push_back(target_path);
-    }
-}
-
 //=============================================================================
 // Main replacement function 
 //=============================================================================
@@ -1793,8 +1815,8 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
                                            normalized_new, target_function);
         
         if (patch_success) {
-            // Update tracker state - only new library is active now
-            update_active_status(normalized_new);
+            // Update tracker state - only new library is active now, original becomes inactive
+            update_active_status(normalized_target, normalized_new);  // <- Changed from old version
             record_patched_library(normalized_new, target_info.path);
             
             // Clean up old libraries

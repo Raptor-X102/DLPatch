@@ -36,7 +36,7 @@ private:
     static uintptr_t hex_to_ptr(const std::string &hex);
 
     pid_t pid_;
-    DL_Manager mgr_;
+    mutable DL_Manager mgr_;
     std::string state_path_;
 };
 

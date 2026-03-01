@@ -12,6 +12,9 @@
 #include <sstream>
 #include <algorithm>
 
+static std::vector<pid_t> get_all_threads(pid_t pid);
+static bool address_in_library(uintptr_t addr, const std::vector<std::pair<uintptr_t, uintptr_t>>& segments);
+
 struct StackInfo {
     uintptr_t start;
     uintptr_t end;
@@ -136,24 +139,29 @@ static bool thread_uses_library(pid_t tid, const std::vector<std::pair<uintptr_t
     return uses;
 }
 
-bool DL_Manager::is_safe_to_replace(const std::string& lib_name) const {
+bool DL_Manager::is_safe_to_replace(const std::string& lib_name) {
+    init_tracker_if_needed();
+    
     LibraryInfo info = get_library_info(lib_name);
-    if (info.segments.empty()) {
-        LOG_ERR("Library '%s' not found in process %d", lib_name.c_str(), pid_);
+    if (info.base_addr == 0) {
+        LOG_ERR("Library %s not found in process memory", lib_name.c_str());
         return false;
     }
     
+    // Get all threads using helper
     std::vector<pid_t> tids = get_threads(pid_);
-    if (tids.empty()) {
-        LOG_ERR("No threads found for PID %d", pid_);
-        return false;
-    }
     
+    // Check each thread using helper
     for (pid_t tid : tids) {
+        // Skip our own thread if we're attached to the process
+        if (tid == gettid()) continue;
+        
         if (thread_uses_library(tid, info.segments)) {
-            LOG_WARN("Thread %d is currently using the library", tid);
+            LOG_WARN("Thread %d is inside library %s", tid, lib_name.c_str());
             return false;
         }
     }
+    
+    LOG_INFO("All threads are outside library %s", lib_name.c_str());
     return true;
 }

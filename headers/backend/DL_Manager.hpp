@@ -17,12 +17,32 @@
 //=============================================================================
 
 // Information about a loaded library
+// DL_Manager.hpp - update LibraryInfo structure with constructor
+
+// Information about a loaded library
 struct LibraryInfo {
     std::string path;    // Full path to the library file
     uintptr_t base_addr; // Base address where library is loaded
     size_t size;         // Total size of the library in memory
+    bool is_original;    // Whether this is the original library (never unloaded)
+    bool is_active;      // Whether this library is currently the target of any patch
     std::vector<std::pair<uintptr_t, uintptr_t>>
         segments; // Memory segments [start, end)
+
+    // Default constructor
+    LibraryInfo() 
+        : base_addr(0)
+        , size(0)
+        , is_original(false)
+        , is_active(false) {}
+        
+    // Constructor with basic parameters
+    LibraryInfo(const std::string& p, uintptr_t addr, size_t sz)
+        : path(p)
+        , base_addr(addr)
+        , size(sz)
+        , is_original(false)
+        , is_active(false) {}
 };
 
 // Tracked library state with rollback data
@@ -141,6 +161,8 @@ public:
 
     void set_tracked_libraries(const std::map<std::string, TrackedLibrary> &libs) {
         tracked_libraries_ = libs;
+        tracker_initialized_ = true;  // Помечаем как инициализированный, чтобы не перезаписывать
+        LOG_DBG("Tracker set with %zu libraries, marked as initialized", libs.size());
     }
 
     const std::map<std::string, TrackedLibrary> &get_tracked_libraries() const {
@@ -150,17 +172,18 @@ public:
     //-------------------------------------------------------------------------
     // Library information methods (DL_Manager_get_lib_data.ipp)
     //-------------------------------------------------------------------------
-    std::vector<std::string>
-    get_loaded_libraries() const; // Get list of loaded libraries
+    std::vector<LibraryInfo>
+    get_loaded_libraries(); // Get list of loaded libraries
     LibraryInfo get_library_info(
-        const std::string &lib_name) const; // Get info about specific library
-    void print_loaded_libraries() const;    // Print all loaded libraries
+        const std::string &lib_name); // Get info about specific library
+    void print_loaded_libraries();    // Print all loaded libraries
+    std::vector<LibraryInfo> parse_maps() const;
 
     //-------------------------------------------------------------------------
     // Safety checks (DL_Manager_check.ipp)
     //-------------------------------------------------------------------------
     bool is_safe_to_replace(
-        const std::string &lib_name) const; // Check if library can be safely replaced
+        const std::string &lib_name); // Check if library can be safely replaced
 
     //-------------------------------------------------------------------------
     // Symbol lookup methods (DL_Manager_extract_funcs_from_lib.ipp)
@@ -210,8 +233,6 @@ public:
     
     void update_active_status(const std::string& normalized_new);
     
-    void record_patched_library(const std::string& normalized_new, const std::string& target_path);
-
     bool replace_library(
         const std::string &target_lib_pattern,
         const std::string &new_lib_path,
@@ -250,6 +271,7 @@ private:
     uintptr_t dlopen_addr_;  // Address of dlopen in target
     uintptr_t dlclose_addr_; // Address of dlclose in target
     uintptr_t syscall_insn_; // Address of syscall instruction
+    bool tracker_initialized_;
 
     std::map<std::string, TrackedLibrary>
         tracked_libraries_; // Tracked libraries by path
@@ -268,6 +290,11 @@ private:
 
     mutable std::map<uintptr_t, CachedLibraryData>
         library_cache_; // Cache by base address
+
+    //-------------------------------------------------------------------------
+    // New initialization method
+    //-------------------------------------------------------------------------
+    void init_tracker_if_needed();  // Will be called from methods that need it 
 
     //-------------------------------------------------------------------------
     // Initialization (DL_Manager_replace.ipp)
@@ -292,6 +319,8 @@ private:
     bool is_library_active(const std::string &lib_path) const;
     uintptr_t get_loaded_library_base(const std::string &lib_path) const;
 
+    void record_patched_library(const std::string& normalized_new, const std::string& target_path);
+    void update_active_status(const std::string& original_path, const std::string& new_path);
     //-------------------------------------------------------------------------
     // Thread control (DL_Manager_replace.ipp)
     //-------------------------------------------------------------------------
