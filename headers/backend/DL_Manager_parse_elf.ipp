@@ -119,17 +119,6 @@ static bool parse_dynamic_info(pid_t pid, uintptr_t lib_base, DynamicInfo& info)
 //=============================================================================
 
 // Callback type: return false to stop iteration, true to continue
-//=============================================================================
-// Symbol iteration utilities
-//=============================================================================
-
-// Callback type: return false to stop iteration, true to continue
-// Note: index parameter removed since it wasn't used anywhere
-//=============================================================================
-// Symbol iteration utilities
-//=============================================================================
-
-// Callback type: return false to stop iteration, true to continue
 using SymbolCallback = std::function<bool(const Elf64_Sym& sym, const std::string& name)>;
 
 static bool iterate_dynamic_symbols(pid_t pid, const DynamicInfo& info, const SymbolCallback& callback) {

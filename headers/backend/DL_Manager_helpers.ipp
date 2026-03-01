@@ -75,5 +75,4 @@ static bool address_in_library(uintptr_t addr, const std::vector<std::pair<uintp
     return false;
 }
 
-extern uintptr_t get_symbol_address(pid_t pid, uintptr_t lib_base, const std::string& sym_name);
 #endif // DL_MANAGER_HELPERS_IPP

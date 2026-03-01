@@ -5,12 +5,33 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <cstdint>
+#include <cstring>
+#include <cctype>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/user.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <dirent.h>
 #include <elf.h>
+#include <iostream>
+#include <iomanip>
+#include <algorithm>
+#include "daemon.hpp"
 #include "logging.hpp"
+
+// Constants
+static const size_t REMOTE_MEM_SIZE = 4096;
+static const size_t SHELLCODE_PATH_OFFSET = 256;
+static const size_t SHELLCODE_RESULT_OFFSET = 512;
+static const time_t MTIME_TOLERANCE = 1;
 
 //=============================================================================
 // Data structures
@@ -43,6 +64,12 @@ struct LibraryInfo {
         , size(sz)
         , is_original(false)
         , is_active(false) {}
+};
+
+struct StackInfo {
+    uintptr_t start;
+    uintptr_t end;
+    size_t size;
 };
 
 // Tracked library state with rollback data
@@ -407,15 +434,56 @@ private:
 // Include implementations
 //=============================================================================
 
-#include "arch.hpp"                              // Architecture-specific definitions
-#include "DL_Manager_helpers.ipp"                // Basic read/write functions
-#include "DL_Manager_parse_elf.ipp"              // ELF parsing utilities
-#include "DL_Manager_cache.ipp"                  // Cache management implementation
-#include "DL_Manager_GOT.ipp"                    // GOT entry lookup implementation
-#include "DL_Manager_get_lib_data.ipp"           // Library information implementation
-#include "DL_Manager_check.ipp"                  // Safety check implementation
-#include "DL_Manager_extract_funcs_from_lib.ipp" // Symbol extraction implementation
-#include "DL_Manager_replace.ipp"                // Main patching implementation
-#include "DL_Manager_rollback.ipp"               // Rollback implementation
+//=============================================================================
+// Include implementations in strict dependency order
+// No forward declarations needed – each module provides what later ones require
+//=============================================================================
 
+#include "arch.hpp"                              // Architecture-specific definitions (syscall numbers, register access, shellcode generation)
+
+// ----- Core utilities -----------------------------------------------------
+#include "DL_Manager_helpers.ipp"                // Basic helpers: string trimming, path normalization, file info, memory reading
+
+// ----- ELF parsing --------------------------------------------------------
+#include "DL_Manager_parse_elf.ipp"              // ELF header, dynamic section parsing, symbol iteration
+
+// ----- Caching layer ------------------------------------------------------
+#include "DL_Manager_cache.ipp"                   // Symbol and GOT entry caching for performance (uses parse_elf)
+
+// ----- GOT manipulation ---------------------------------------------------
+#include "DL_Manager_GOT.ipp"                     // GOT entry lookup using cache
+
+// ----- Remote memory operations -------------------------------------------
+#include "DL_Manager_memory.ipp"                   // Remote memory allocation (mmap), writing, shellcode management (uses helpers)
+
+// ----- Thread control -----------------------------------------------------
+#include "DL_Manager_threads.ipp"                  // Thread enumeration, stopping, resuming, safety checks (uses helpers, memory for register dumps)
+
+// ----- Library loading / unloading ----------------------------------------
+#include "DL_Manager_load.ipp"                      // Loading new libraries via dlopen, unloading via dlclose, remote syscall testing (uses memory, threads)
+
+// ----- Library state tracking ---------------------------------------------
+#include "DL_Manager_tracker.ipp"                    // Management of tracked libraries status (active/original, patched libraries list) (uses helpers)
+
+// ----- Library information from /proc/pid/maps ---------------------------
+#include "DL_Manager_get_lib_data.ipp"               // Parsing /proc/pid/maps, initializing tracker, getting library info (uses helpers, tracker)
+
+// ----- Safety checks ------------------------------------------------------
+#include "DL_Manager_check.ipp"                       // Checking if it's safe to replace a library (threads not inside) (uses get_lib_data, threads)
+
+// ----- Symbol extraction --------------------------------------------------
+#include "DL_Manager_extract_funcs_from_lib.ipp"      // Getting function symbols, addresses, sizes, filtering exported functions (uses parse_elf, cache)
+
+// ----- Patching implementation --------------------------------------------
+#include "DL_Manager_patch.ipp"                        // Applying JMP and GOT patches to redirect functions (uses GOT, extract_funcs, memory)
+
+// ----- Library state evaluation -------------------------------------------
+#include "DL_Manager_state.ipp"                        // Checking if library needs reloading, loading new version if necessary (uses load, helpers, tracker)
+
+// ----- Main replacement logic ---------------------------------------------
+#include "DL_Manager_replace.ipp"                      // Core replace_library function and its helpers (uses everything above)
+
+// ----- Rollback functionality ---------------------------------------------
+#include "DL_Manager_rollback.ipp"                     // Rolling back patches for a library or a single function (uses threads, GOT, extract_funcs, memory)
+                                                       
 #endif // DL_MANAGER_HPP
