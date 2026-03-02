@@ -1,9 +1,19 @@
-// DL_manager_tracker.ipp
+//=============================================================================
+// DL_Manager_tracker.ipp
+// Library state tracking and status management
+//=============================================================================
 
+/**
+ * @brief Record that a new library patches the target library
+ * @param normalized_new Normalized path of new library
+ * @param target_path Path of target library being patched
+ * 
+ * Updates the patched_libraries list for the new library to track
+ * which original libraries it replaces. Used for cleanup and rollback.
+ */
 void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& target_path) {
     auto new_lib_it = tracked_libraries_.find(normalized_new);
     if (new_lib_it != tracked_libraries_.end()) {
-        // is_active already set in update_active_status
         // Add target to patched_libraries list if not already there
         if (std::find(new_lib_it->second.patched_libraries.begin(), 
                      new_lib_it->second.patched_libraries.end(), 
@@ -14,6 +24,11 @@ void DL_Manager::record_patched_library(const std::string& normalized_new, const
     }
 }
 
+/**
+ * @brief Check if a library is currently active (patched to)
+ * @param lib_path Path to library
+ * @return true if library is active
+ */
 bool DL_Manager::is_library_active(const std::string& lib_path) const {
     auto it = tracked_libraries_.find(lib_path);
     if (it == tracked_libraries_.end()) {
@@ -22,6 +37,11 @@ bool DL_Manager::is_library_active(const std::string& lib_path) const {
     return it->second.is_active;
 }
 
+/**
+ * @brief Update active status when switching from original to new library
+ * @param original_path Path of original library (becomes inactive)
+ * @param new_path Path of new library (becomes active)
+ */
 void DL_Manager::update_active_status(const std::string& original_path, const std::string& new_path) {
     // Deactivate original library
     auto orig_it = tracked_libraries_.find(original_path);
@@ -38,6 +58,19 @@ void DL_Manager::update_active_status(const std::string& original_path, const st
     }
 }
 
+/**
+ * @brief Ensure target library is present in tracker (add if missing)
+ * @param normalized_target Normalized path of target
+ * @param clean_path Cleaned path (for logging)
+ * @param target_base Base address of target
+ * @param target_mtime File modification time
+ * @param target_size File size
+ * @param target_info_ok Whether file info was successfully obtained
+ * 
+ * Adds target as original library if not already tracked.
+ * This happens when replacing a library that was loaded by the process
+ * before our tracker was initialized.
+ */
 void DL_Manager::ensure_target_in_tracker(const std::string& normalized_target,
                                            const std::string& clean_path,
                                            uintptr_t target_base,
@@ -72,6 +105,9 @@ void DL_Manager::ensure_target_in_tracker(const std::string& normalized_target,
 #endif
 }
 
+/**
+ * @brief Print current tracker status for debugging
+ */
 void DL_Manager::print_library_tracker() const {
     LOG_INFO("=== Library Tracker Status ===");
     LOG_INFO("Tracked libraries: %zu", tracked_libraries_.size());
@@ -106,6 +142,17 @@ void DL_Manager::print_library_tracker() const {
     LOG_INFO("==============================");
 }
 
+/**
+ * @brief Update tracked file information and detect changes
+ * @param lib Library to update
+ * @param mtime Current modification time
+ * @param size Current file size
+ * @param info_ok Whether file info was successfully obtained
+ * 
+ * Compares current file info with stored values and marks as changed
+ * if significant differences detected (size change or mtime change
+ * beyond MTIME_TOLERANCE).
+ */
 void DL_Manager::update_tracked_file_info(TrackedLibrary& lib, time_t mtime, size_t size, bool info_ok) {
     if (!info_ok) {
         LOG_DBG("update_tracked_file_info: no valid info, skipping");

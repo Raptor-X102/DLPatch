@@ -1,7 +1,23 @@
+//=============================================================================
+// daemon.cpp
+// Entry point for the daemon executable
+//=============================================================================
+
 #include "daemon.hpp"
 #include <iostream>
 #include <csignal>
 
+/**
+ * @brief Daemon main entry point
+ * @param argc Argument count
+ * @param argv Argument vector
+ * @return 0 on success, 1 on error
+ * 
+ * Usage: dl_manager_daemon {start|stop|status}
+ *   start  - Start the background daemon
+ *   stop   - Stop the running daemon
+ *   status - Check if daemon is running
+ */
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " {start|stop|status}\n";

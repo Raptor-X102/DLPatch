@@ -1,3 +1,22 @@
+//=============================================================================
+// DL_Manager_patch.ipp
+// Function patching implementation (JMP and GOT redirection)
+//=============================================================================
+
+/**
+ * @brief Apply a single function patch (either GOT or JMP based on function size)
+ * @param tid Thread ID for memory writes
+ * @param target_lib_path Path to target library
+ * @param old_func Address of function in old library
+ * @param new_func Address of function in new library
+ * @param old_func_size Size of function in old library
+ * @param func_name Name of function being patched
+ * @return true if patch succeeded
+ * 
+ * For small functions (<16 bytes), uses GOT patching.
+ * For larger functions (>=16 bytes), uses JMP patching (5-byte relative jump).
+ * Saves original bytes/GOT values for potential rollback.
+ */
 bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uintptr_t old_func,
                               uintptr_t new_func, size_t old_func_size,
                   const std::string& func_name) {
@@ -73,6 +92,20 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
     return true;
 }
 
+/**
+ * @brief Apply all function patches between old and new library
+ * @param tid Thread ID for memory writes
+ * @param target_lib_path Path to target library
+ * @param old_base Base address of old library
+ * @param new_base Base address of new library
+ * @param new_lib_path Path to new library (for tracker updates)
+ * @param target_function "all" for all functions, or specific function name
+ * @return true if at least one patch succeeded
+ * 
+ * If target_function is "all", attempts to patch every exported function
+ * that exists in both libraries. Otherwise, patches only the specified function.
+ * Updates tracker with list of successfully patched functions.
+ */
 bool DL_Manager::apply_all_patches(pid_t tid, 
                                    const std::string& target_lib_path, 
                                    uintptr_t old_base, 
@@ -176,6 +209,19 @@ bool DL_Manager::apply_all_patches(pid_t tid,
     }
 }
 
+/**
+ * @brief Clean up old, unused libraries after successful patch
+ * @param target_lib_path Path to target library (original)
+ * @param new_lib_path Path to new library (replacement)
+ * @param tid Thread ID for unload operations
+ * @param saved_regs Saved registers for thread
+ * 
+ * Unloads any libraries that are:
+ * - Not the new library
+ * - Not original libraries
+ * - Inactive (not currently patched to)
+ * This prevents memory leaks from accumulating replacement libraries.
+ */
 void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
                                         const std::string& new_lib_path,
                                         pid_t tid,

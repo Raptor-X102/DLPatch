@@ -1,3 +1,24 @@
+//=============================================================================
+// DL_Manager_load.ipp
+// Remote library loading and unloading via shellcode injection
+//=============================================================================
+
+/**
+ * @brief Load a new library in the target process using remote code injection
+ * @param tid Thread ID to execute the loading code
+ * @param lib_path Path to the library file to load
+ * @param out_handle [out] Handle returned by dlopen
+ * @param saved_regs Saved registers of the worker thread (will be restored)
+ * @return Base address of loaded library, or 0 on failure
+ * 
+ * This function:
+ * 1. Allocates remote memory for shellcode, path, and result
+ * 2. Writes library path and shellcode to remote memory
+ * 3. Executes shellcode that calls dlopen
+ * 4. Reads the resulting handle from remote memory
+ * 5. Finds the library base address in /proc/pid/maps
+ * 6. Cleans up remote memory
+ */
 uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
                                         uintptr_t& out_handle,
                                         struct user_regs_struct& saved_regs) {
@@ -10,13 +31,12 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     LOG_DBG("dlopen_addr=0x%lx, syscall_insn=0x%lx", dlopen_addr_, syscall_insn_);
 
 #ifdef DEBUG
-    // First check if thread is still alive
+    // Debug-only thorough validation
     if (kill(tid, 0) == -1) {
         LOG_ERR("Thread %d is no longer alive: %s", tid, strerror(errno));
         return 0;
     }
     
-    // Check if we can get registers (thread should be stopped)
     struct user_regs_struct check_regs;
     if (ptrace(PTRACE_GETREGS, tid, nullptr, &check_regs) == -1) {
         LOG_ERR("Thread %d not accessible via ptrace: %s", tid, strerror(errno));
@@ -24,12 +44,10 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     }
     LOG_DBG("Thread %d is accessible, IP=0x%llx", tid, (unsigned long long)Arch::get_ip(check_regs));
     
-    // Test remote syscall before proceeding
     uintptr_t test_result;
     if (!Arch::remote_syscall(tid, test_result, Arch::SYS_GETPID, 0, 0, 0, 0, 0, 0, syscall_insn_)) {
         LOG_ERR("remote_syscall test failed before allocation");
         
-        // Dump thread state for debugging
         LOG_ERR("Dumping thread %d state:", tid);
         if (ptrace(PTRACE_GETREGS, tid, nullptr, &check_regs) == 0) {
             LOG_ERR("  IP=0x%llx, SP=0x%llx", 
@@ -37,7 +55,6 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
                     (unsigned long long)Arch::get_sp(check_regs));
         }
         
-        // Try to detach and re-attach?
         LOG_DBG("Attempting to re-attach to thread %d", tid);
         ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
         usleep(10000);
@@ -45,7 +62,6 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
             waitpid(tid, nullptr, 0);
             LOG_DBG("Re-attach successful");
             
-            // Restore saved registers from before injection
             if (ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs) == 0) {
                 LOG_DBG("Registers restored");
             }
@@ -116,15 +132,22 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
     return new_lib_base;
 }
 
+/**
+ * @brief Unload a library by its handle using remote code injection
+ * @param tid Thread ID to execute the unloading code
+ * @param handle Handle returned by dlopen
+ * @param saved_regs Saved registers of the worker thread (will be restored)
+ * @return true if unload succeeded, false otherwise
+ * 
+ * Similar to load_new_library but calls dlclose instead of dlopen.
+ */
 bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
                                            struct user_regs_struct& saved_regs) {
-    // Check that required addresses are initialized
     if (dlclose_addr_ == 0 || syscall_insn_ == 0) {
         LOG_ERR("Required addresses not initialized");
         return false;
     }
     
-    // Validate handle
     if (handle == 0) {
         LOG_ERR("Invalid handle (0)");
         return false;
@@ -141,7 +164,6 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    // Address where dlclose result will be stored
     uintptr_t result_addr = remote_mem + 256;
     
     LOG_DBG("Unloading library with handle = 0x%lx", handle);
@@ -149,7 +171,6 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
     LOG_DBG("Result addr: 0x%lx", result_addr);
     LOG_DBG("dlclose addr: 0x%lx", dlclose_addr_);
     
-    // Generate dlclose shellcode
     auto shellcode = Arch::generate_dlclose_shellcode(handle, dlclose_addr_, result_addr);
     
     // Clear result area before execution
@@ -160,14 +181,12 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    // Write shellcode to remote memory
     if (!write_remote_memory(tid, remote_mem, shellcode.data(), shellcode.size())) {
         LOG_ERR("Failed to write unload shellcode");
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
-    // Set instruction pointer to shellcode
     struct user_regs_struct new_regs = saved_regs;
     Arch::set_ip(new_regs, remote_mem);
     
@@ -177,14 +196,12 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         return false;
     }
     
-    // Execute shellcode
     if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) == -1) {
         LOG_ERR("ptrace CONT failed: %s", strerror(errno));
         remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
         return false;
     }
     
-    // Wait for shellcode to complete (should hit int3)
     int status;
     waitpid(tid, &status, 0);
     
@@ -196,15 +213,13 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         LOG_DBG("Thread stopped with signal %d", sig);
         
         if (sig == SIGTRAP) {
-            // Shellcode completed successfully, read dlclose result
             if (read_remote_memory(tid, result_addr, &dlclose_result, sizeof(dlclose_result))) {
                 LOG_DBG("dlclose returned %lu", dlclose_result);
-                success = (dlclose_result == 0);  // dlclose returns 0 on success
+                success = (dlclose_result == 0);
             } else {
                 LOG_ERR("Failed to read dlclose result");
             }
         } else {
-            // Unexpected signal - dump registers for debugging
             LOG_ERR("Unexpected signal %d during unload", sig);
             Arch::dump_registers(tid, this);
         }
@@ -212,10 +227,7 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         LOG_ERR("Unexpected wait status: %d", status);
     }
     
-    // Restore original registers
     ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs);
-    
-    // Free remote memory
     remote_munmap(pid_, remote_mem, mem_size, syscall_insn_);
     
     if (success) {
@@ -225,8 +237,14 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
     return success;
 }
 
+/**
+ * @brief Unload a library by its path (public API)
+ * @param lib_path Path to the library to unload
+ * @return true if unload succeeded, false otherwise
+ * 
+ * Only non-original, inactive libraries can be unloaded.
+ */
 bool DL_Manager::unload_library(const std::string& lib_path) {
-    // Normalize path for tracker lookup
     std::string normalized = normalize_path(lib_path);
     
     auto it = tracked_libraries_.find(normalized);
@@ -237,7 +255,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     
     TrackedLibrary& lib = it->second;
     
-    // Safety checks
     if (lib.is_active) {
         LOG_ERR("Cannot unload active library");
         return false;
@@ -249,7 +266,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     
     LOG_INFO("Unloading library: %s", lib_path.c_str());
     
-    // Stop all threads in target process
     std::vector<pid_t> tids = get_all_threads(pid_);
     std::vector<ThreadContext> contexts;
     
@@ -258,7 +274,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         return false;
     }
     
-    // Select worker thread (main thread or first available)
     pid_t worker_tid = pid_;
     bool found = false;
     for (const auto& ctx : contexts) {
@@ -272,7 +287,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         LOG_DBG("Main thread not found, using thread %d for unload", worker_tid);
     }
     
-    // Prepare worker thread for injection
     struct user_regs_struct prepared_regs;
     if (!prepare_thread_for_injection(worker_tid, prepared_regs)) {
         restore_and_detach_all(contexts);
@@ -280,7 +294,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     }
     
 #ifdef DEBUG
-    // Verify syscall works before proceeding (debug only)
     if (!test_syscall(worker_tid)) {
         LOG_ERR("Syscall test failed before unload");
         restore_and_detach_all(contexts);
@@ -292,7 +305,6 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     bool result = unload_library_by_handle(worker_tid, lib.handle, prepared_regs);
     
     if (result) {
-        // Clean up tracker and cache
         invalidate_cache(lib.base_addr);
         tracked_libraries_.erase(it);
         LOG_INFO("Library %s successfully unloaded", lib_path.c_str());
@@ -300,12 +312,17 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
         LOG_ERR("Failed to unload library %s", lib_path.c_str());
     }
     
-    // Restore and detach all threads
     restore_and_detach_all(contexts);
     
     return result;
 }
 
+/**
+ * @brief Check if a library is present in /proc/pid/maps
+ * @param lib_path Path to check
+ * @param base_addr [out] Base address if found
+ * @return true if library found in maps
+ */
 bool DL_Manager::is_library_in_maps(const std::string& lib_path, uintptr_t& base_addr) const {
     std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
     std::ifstream maps_file(maps_path);
@@ -324,15 +341,16 @@ bool DL_Manager::is_library_in_maps(const std::string& lib_path, uintptr_t& base
     return false;
 }
 
-// Check if library is already loaded in target process
-// Returns:
-// - true with base_addr/handle filled if found in tracker or /proc/pid/maps
-// - false if not found (library needs to be loaded)
+/**
+ * @brief Check if library is already loaded (in tracker or in maps)
+ * @param lib_path Path to check
+ * @param base_addr [out] Base address if found
+ * @param handle [out] Handle if found in tracker, 0 if only in maps
+ * @return true if library found
+ */
 bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_t& base_addr, uintptr_t& handle) {
-    // Normalize path for tracker lookup
     std::string normalized = normalize_path(lib_path);
     
-    // First check our tracker (libraries we loaded ourselves)
     auto it = tracked_libraries_.find(normalized);
     if (it != tracked_libraries_.end()) {
         base_addr = it->second.base_addr;
@@ -340,7 +358,6 @@ bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_
         return true;
     }
     
-    // If not in tracker, check /proc/pid/maps (using original path for string search)
     std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
     std::ifstream maps_file(maps_path);
     if (!maps_file.is_open()) return false;
@@ -359,6 +376,11 @@ bool DL_Manager::is_library_already_loaded(const std::string& lib_path, uintptr_
     return false;
 }
 
+/**
+ * @brief Get base address of loaded library from /proc/pid/maps
+ * @param lib_path Path to find
+ * @return Base address or 0 if not found
+ */
 uintptr_t DL_Manager::get_loaded_library_base(const std::string& lib_path) const {
     std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
     std::ifstream maps_file(maps_path);
@@ -376,28 +398,32 @@ uintptr_t DL_Manager::get_loaded_library_base(const std::string& lib_path) const
     return 0;
 }
 
+/**
+ * @brief Execute shellcode and retrieve dlopen result
+ * @param tid Thread to execute shellcode
+ * @param shellcode_addr Address of shellcode in remote process
+ * @param saved_regs Saved registers (will be restored)
+ * @param out_handle [out] Handle returned by dlopen
+ * @return true if successful
+ */
 bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode_addr,
                                                    struct user_regs_struct& saved_regs,
                                                    uintptr_t& out_handle) {
-    // Create new register state with IP pointing to shellcode
     struct user_regs_struct new_regs = saved_regs;
     Arch::set_ip(new_regs, shellcode_addr);
     
     LOG_DBG("Setting IP to 0x%lx, original SP=0x%lx", shellcode_addr, Arch::get_sp(saved_regs));
     
-    // Apply new register state to remote thread
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &new_regs) == -1) {
         LOG_ERR("ptrace SETREGS failed: %s", strerror(errno));
         return false;
     }
     
-    // Let the thread execute the shellcode
     if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) == -1) {
         LOG_ERR("ptrace CONT failed: %s", strerror(errno));
         return false;
     }
     
-    // Wait for shellcode to hit int3 and stop
     int status;
     waitpid(tid, &status, 0);
     
@@ -409,14 +435,12 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
         LOG_DBG("Thread stopped with signal %d", sig);
         
         if (sig == SIGTRAP) {
-            // Shellcode completed successfully, read the handle
             LOG_DBG("Got SIGTRAP, reading dlopen result");
             if (read_remote_memory(tid, result_addr, &handle, sizeof(handle))) {
                 LOG_DBG("dlopen returned handle 0x%lx", handle);
                 if (handle != 0) {
                     out_handle = handle;
                     
-                    // Restore original registers
                     if (ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs) == -1) {
                         LOG_ERR("Failed to restore registers after shellcode: %s", strerror(errno));
                     }
@@ -429,7 +453,6 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
                 LOG_ERR("Failed to read handle from result_addr");
             }
         } else if (sig == SIGSEGV) {
-            // Shellcode crashed - dump debug info
             LOG_ERR("Segmentation fault in shellcode");
             
             siginfo_t siginfo;
@@ -450,7 +473,6 @@ bool DL_Manager::execute_shellcode_and_get_handle(pid_t tid, uintptr_t shellcode
         LOG_ERR("Unexpected wait status %d", status);
     }
     
-    // Restore original registers on any failure
     LOG_INFO("Restoring original registers after error");
     if (ptrace(PTRACE_SETREGS, tid, nullptr, &saved_regs) == -1) {
         LOG_ERR("Failed to restore registers after shellcode: %s", strerror(errno));

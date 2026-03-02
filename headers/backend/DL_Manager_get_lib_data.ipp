@@ -1,15 +1,16 @@
-/// DL_Manager_get_lib_data.ipp
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <iostream>
-#include <cctype>
-#include <set>
-#include <linux/limits.h> 
-#include <stdlib.h>        
+//=============================================================================
+// DL_Manager_get_lib_data.ipp
+// Library information retrieval from /proc/pid/maps and tracker management
+//=============================================================================
 
-// DL_Manager_get_lib_data.ipp - parse_maps возвращает LibraryInfo
-
+/**
+ * @brief Parse /proc/pid/maps to get information about loaded libraries
+ * @return Vector of LibraryInfo structures for all loaded libraries
+ * 
+ * Reads the memory maps of the target process and extracts information about
+ * loaded shared libraries (.so files). Each library may have multiple segments
+ * which are stored in the segments vector.
+ */
 std::vector<LibraryInfo> DL_Manager::parse_maps() const {
     std::vector<LibraryInfo> libs;
     std::string maps_path = "/proc/" + std::to_string(pid_) + "/maps";
@@ -24,7 +25,7 @@ std::vector<LibraryInfo> DL_Manager::parse_maps() const {
     std::string line;
 
     while (std::getline(file, line)) {
-        // Пропускаем если это не библиотека (как в оригинальной версии)
+        // Skip lines that don't look like shared libraries
         if (line.find(".so") == std::string::npos && 
             line.find(".so.") == std::string::npos) {
             continue;
@@ -37,7 +38,7 @@ std::vector<LibraryInfo> DL_Manager::parse_maps() const {
         iss >> address >> perms >> offset >> dev >> inode;
         std::getline(iss, pathname);
 
-        // Clean path
+        // Clean path (remove leading spaces)
         if (!pathname.empty() && pathname[0] == ' ') pathname = pathname.substr(1);
         
         // Remove " (deleted)" suffix if present
@@ -76,10 +77,21 @@ std::vector<LibraryInfo> DL_Manager::parse_maps() const {
     return libs;
 }
 
+/**
+ * @brief Initialize the library tracker if not already done
+ * 
+ * This function populates the tracker with all libraries currently loaded
+ * in the target process. It preserves status information from previously
+ * loaded state and marks all newly found libraries as original and active.
+ * 
+ * The tracker uses multiple path variants (original path, cleaned path,
+ * normalized path) to ensure reliable lookup regardless of how a library
+ * is referenced.
+ */
 void DL_Manager::init_tracker_if_needed() {
     if (tracker_initialized_) return;
     
-    LOG_INFO("Initializing tracker with all loaded libraries");
+    LOG_DBG("Initializing tracker with all loaded libraries");
     
     auto libs = parse_maps();
     std::set<std::string> processed;
@@ -93,7 +105,7 @@ void DL_Manager::init_tracker_if_needed() {
             clean_path = clean_path.substr(start);
         }
         
-        // Try to normalize
+        // Try to normalize to absolute path
         char resolved_path[PATH_MAX];
         std::string normalized;
         if (realpath(clean_path.c_str(), resolved_path) != nullptr) {
@@ -169,7 +181,7 @@ void DL_Manager::init_tracker_if_needed() {
         // NEW library - add as original and ACTIVE
         TrackedLibrary tracked(clean_path, 0, lib.base_addr, std::vector<std::string>());
         tracked.is_original = true;
-        tracked.is_active = true;  // Новые библиотеки активны
+        tracked.is_active = true;  // New libraries are active
         tracked.mtime = mtime;
         tracked.file_size = file_size;
         
@@ -187,10 +199,18 @@ void DL_Manager::init_tracker_if_needed() {
     }
     
     tracker_initialized_ = true;
-    LOG_INFO("Tracker initialized: %d new libraries added, total %zu unique libraries", 
+    LOG_DBG("Tracker initialized: %d new libraries added, total %zu unique libraries", 
              added_count, tracked_libraries_.size());
 }
 
+/**
+ * @brief Get list of all loaded libraries with their current status
+ * @return Vector of LibraryInfo structures with status information
+ * 
+ * Combines information from /proc/pid/maps with tracker status
+ * (is_original, is_active) to provide a complete picture of loaded libraries.
+ * Removes duplicates and returns one entry per unique normalized path.
+ */
 std::vector<LibraryInfo> DL_Manager::get_loaded_libraries() {
     init_tracker_if_needed();
     
@@ -267,6 +287,14 @@ std::vector<LibraryInfo> DL_Manager::get_loaded_libraries() {
     return result;
 }
 
+/**
+ * @brief Get information about a specific library by name pattern
+ * @param lib_name Pattern to search for in library paths
+ * @return LibraryInfo structure (base_addr=0 if not found)
+ * 
+ * Finds the first library whose path contains the given pattern.
+ * Includes status information from tracker.
+ */
 LibraryInfo DL_Manager::get_library_info(const std::string& lib_name) {
     init_tracker_if_needed();  // Call initialization first
     
@@ -299,6 +327,12 @@ LibraryInfo DL_Manager::get_library_info(const std::string& lib_name) {
     return LibraryInfo();
 }
 
+/**
+ * @brief Print all loaded libraries with their status
+ * 
+ * Useful for debugging and user information.
+ * Shows path and status (original/replacement, active/inactive).
+ */
 void DL_Manager::print_loaded_libraries() {
     init_tracker_if_needed();
     

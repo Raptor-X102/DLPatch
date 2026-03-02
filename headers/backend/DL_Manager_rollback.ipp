@@ -1,5 +1,17 @@
+//=============================================================================
 // DL_Manager_rollback.ipp
+// Rollback functionality for reverting patches
+//=============================================================================
 
+/**
+ * @brief Rollback all patches applied to a library
+ * @param lib_path Path to library to rollback
+ * @return true if all patches were successfully reverted
+ * 
+ * Restores original GOT entries and JMP patches from saved backups.
+ * After successful rollback, the library becomes active again and any
+ * replacement library is deactivated.
+ */
 bool DL_Manager::rollback_library(const std::string& lib_path) {
     std::string normalized = normalize_path(lib_path);
     LOG_INFO("Attempting to rollback library: %s", normalized.c_str());
@@ -123,6 +135,15 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
     return all_ok;
 }
 
+/**
+ * @brief Rollback a single function patch
+ * @param lib_path Path to library containing the function
+ * @param func_name Name of function to rollback
+ * @return true if patch was successfully reverted
+ * 
+ * Restores either GOT entry or JMP patch for the specified function,
+ * depending on which type of patch was originally applied.
+ */
 bool DL_Manager::rollback_function(const std::string& lib_path, const std::string& func_name) {
     std::string normalized = normalize_path(lib_path);
     LOG_INFO("Attempting to rollback function %s from %s", func_name.c_str(), lib_path.c_str());

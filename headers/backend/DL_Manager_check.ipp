@@ -1,17 +1,18 @@
+//=============================================================================
 // DL_Manager_check.ipp
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/user.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <cstring>
-#include <vector>
-#include <iostream>
-#include <cctype>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
+// Safety checks for library replacement
+//=============================================================================
 
+/**
+ * @brief Check if it's safe to replace a library
+ * @param lib_name Name or pattern of the library to check
+ * @return true if no threads are using the library, false otherwise
+ * 
+ * Safety means:
+ * 1. No thread's instruction pointer is inside the library
+ * 2. No thread's stack contains pointers to the library
+ * If any thread is using the library, replacement could cause crashes.
+ */
 bool DL_Manager::is_safe_to_replace(const std::string& lib_name) {
     init_tracker_if_needed();
     

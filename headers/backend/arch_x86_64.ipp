@@ -1,3 +1,8 @@
+//=============================================================================
+// arch_x86_64.ipp
+// x86-64 architecture-specific implementations
+//=============================================================================
+
 #ifndef ARCH_X86_64_IPP
 #define ARCH_X86_64_IPP
 
@@ -9,12 +14,15 @@
 #include <vector>
 #include <cstring>
 
-// Forward declaration (достаточно для объявления)
+// Forward declaration for find_syscall_instruction
 class DL_Manager;
 
 namespace Arch {
 
-// Register access (можно оставить inline реализации)
+//=============================================================================
+// Register accessors - inline for performance
+//=============================================================================
+
 inline uintptr_t get_ip(const user_regs_struct& regs) { return regs.rip; }
 inline void set_ip(user_regs_struct& regs, uintptr_t val) { regs.rip = val; }
 inline uintptr_t get_sp(const user_regs_struct& regs) { return regs.rsp; }
@@ -38,13 +46,40 @@ inline void set_syscall_num(user_regs_struct& regs, uintptr_t val) { regs.rax = 
 inline uintptr_t get_syscall_ret(const user_regs_struct& regs) { return regs.rax; }
 inline void set_syscall_ret(user_regs_struct& regs, uintptr_t val) { regs.rax = val; }
 
+//=============================================================================
+// System call numbers for x86-64 Linux
+//=============================================================================
+
 constexpr long SYS_MMAP = 9;
 constexpr long SYS_MUNMAP = 11;
 constexpr long SYS_GETPID = 39;
-constexpr int R_JUMP_SLOT = 7;
+constexpr int R_JUMP_SLOT = 7;  // R_X86_64_JUMP_SLOT relocation type
+
+//=============================================================================
+// Debug helpers
+//=============================================================================
 
 inline std::vector<uint8_t> breakpoint_instruction() { return {0xCC}; }
 
+//=============================================================================
+// Shellcode generation
+//=============================================================================
+
+/**
+ * @brief Generate shellcode to call dlopen in remote process
+ * @param path_addr Address where library path is stored
+ * @param dlopen_addr Address of dlopen function
+ * @param result_addr Address where result (handle) should be stored
+ * @return Vector of bytes containing shellcode
+ * 
+ * The shellcode:
+ * 1. Sets up stack frame and saves registers
+ * 2. Moves path_addr to RDI (first argument)
+ * 3. Moves RTLD_NOW (2) to RSI (second argument)
+ * 4. Calls dlopen
+ * 5. Stores returned handle at result_addr
+ * 6. Restores registers and traps (int3) for debugger
+ */
 inline std::vector<uint8_t> generate_dlopen_shellcode(uintptr_t path_addr, uintptr_t dlopen_addr, uintptr_t result_addr) {
     std::vector<uint8_t> shellcode = {
         // Prologue: save registers and set up stack frame
@@ -98,6 +133,15 @@ inline std::vector<uint8_t> generate_dlopen_shellcode(uintptr_t path_addr, uintp
     return shellcode;
 }
 
+/**
+ * @brief Generate shellcode to call dlclose in remote process
+ * @param handle Handle returned by dlopen
+ * @param dlclose_addr Address of dlclose function
+ * @param result_addr Address where result (0 on success) should be stored
+ * @return Vector of bytes containing shellcode
+ * 
+ * Similar to dlopen shellcode but calls dlclose with the handle as argument.
+ */
 inline std::vector<uint8_t> generate_dlclose_shellcode(uintptr_t handle, uintptr_t dlclose_addr, uintptr_t result_addr) {
     std::vector<uint8_t> shellcode = {
         // prologue: save registers
@@ -161,6 +205,14 @@ inline std::vector<uint8_t> generate_dlclose_shellcode(uintptr_t handle, uintptr
     return shellcode;
 }
 
+/**
+ * @brief Create a 5-byte relative JMP instruction
+ * @param from_addr Address where JMP will be placed
+ * @param to_addr Target address to jump to
+ * @return Vector of 5 bytes: 0xE9 + 32-bit relative offset
+ * 
+ * Calculates relative offset: to_addr - (from_addr + 5)
+ */
 inline std::vector<uint8_t> create_jmp_patch(uintptr_t from_addr, uintptr_t to_addr) {
     int32_t rel32 = static_cast<int32_t>(to_addr - (from_addr + 5));
     std::vector<uint8_t> patch(5);
@@ -169,6 +221,18 @@ inline std::vector<uint8_t> create_jmp_patch(uintptr_t from_addr, uintptr_t to_a
     return patch;
 }
 
+//=============================================================================
+// Syscall instruction location
+//=============================================================================
+
+/**
+ * @brief Find the address of a syscall instruction in libc
+ * @param mgr DL_Manager instance (for memory reading)
+ * @param libc_base Base address of libc
+ * @return Address of syscall instruction, or 0 if not found
+ * 
+ * Looks for the pattern 0x0F 0x05 (syscall) in the syscall() function.
+ */
 uintptr_t find_syscall_instruction(DL_Manager* mgr, uintptr_t libc_base) {
     uintptr_t syscall_func = mgr->get_symbol_address(libc_base, "syscall");
     if (!syscall_func) return 0;
@@ -185,6 +249,26 @@ uintptr_t find_syscall_instruction(DL_Manager* mgr, uintptr_t libc_base) {
     return 0;
 }
 
+//=============================================================================
+// Remote syscall execution
+//=============================================================================
+
+/**
+ * @brief Execute a system call in a remote thread
+ * @param pid Thread ID
+ * @param result [out] Return value of syscall
+ * @param number Syscall number
+ * @param arg1-6 Syscall arguments
+ * @param syscall_insn_addr Address of syscall instruction in remote process
+ * @return true if syscall executed successfully
+ * 
+ * This function:
+ * 1. Saves current registers of the thread
+ * 2. Sets up registers for the desired syscall
+ * 3. Single-steps through the syscall instruction
+ * 4. Reads the result from RAX
+ * 5. Restores original registers
+ */
 bool remote_syscall(pid_t pid, uintptr_t& result, long number,
                     uintptr_t arg1, uintptr_t arg2, uintptr_t arg3,
                     uintptr_t arg4, uintptr_t arg5, uintptr_t arg6,
@@ -268,6 +352,17 @@ bool remote_syscall(pid_t pid, uintptr_t& result, long number,
     return true;
 }
 
+//=============================================================================
+// Debugging utilities
+//=============================================================================
+
+/**
+ * @brief Dump registers and code around RIP for debugging
+ * @param tid Thread ID
+ * @param mgr DL_Manager instance (for memory reading)
+ * 
+ * Called when shellcode crashes to help diagnose the issue.
+ */
 inline void dump_registers(pid_t tid, DL_Manager* mgr) {
     struct user_regs_struct regs;
     if (ptrace(PTRACE_GETREGS, tid, nullptr, &regs) == -1) {

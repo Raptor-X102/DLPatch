@@ -1,8 +1,15 @@
-#include <elf.h>
-#include <vector>
-#include <cstring>
-#include <functional>
+//=============================================================================
+// DL_Manager_parse_elf.ipp
+// ELF parsing utilities for reading dynamic section, symbols, and GOT
+//=============================================================================
 
+/**
+ * @brief Read and validate ELF header from remote process
+ * @param pid Target process ID
+ * @param lib_base Base address of library
+ * @param ehdr [out] ELF header structure
+ * @return true if header read successfully and is valid ELF
+ */
 static bool read_elf_header(pid_t pid, uintptr_t lib_base, Elf64_Ehdr& ehdr) {
     if (!read_struct(pid, lib_base, ehdr)) {
         LOG_ERR("Failed to read ELF header at 0x%lx", lib_base);
@@ -15,7 +22,12 @@ static bool read_elf_header(pid_t pid, uintptr_t lib_base, Elf64_Ehdr& ehdr) {
     return true;
 }
 
-// GNU hash table parser
+/**
+ * @brief Parse GNU hash table to determine number of symbols
+ * @param pid Target process ID
+ * @param gnu_hash_addr Address of GNU hash table
+ * @return Number of symbols (nchain) or 0 on failure
+ */
 static uint32_t parse_gnu_hash(pid_t pid, uintptr_t gnu_hash_addr) {
     uint32_t header[4];
     if (!read_process_memory(pid, gnu_hash_addr, header, sizeof(header))) {
@@ -53,6 +65,16 @@ static uint32_t parse_gnu_hash(pid_t pid, uintptr_t gnu_hash_addr) {
     return max_idx + 1;
 }
 
+/**
+ * @brief Parse dynamic section information from ELF
+ * @param pid Target process ID
+ * @param lib_base Base address of library
+ * @param info [out] Filled DynamicInfo structure
+ * @return true if successful
+ * 
+ * Reads ELF header, program headers, and dynamic section to extract
+ * addresses of string table, symbol table, relocation tables, etc.
+ */
 static bool parse_dynamic_info(pid_t pid, uintptr_t lib_base, DynamicInfo& info) {
     Elf64_Ehdr ehdr;
     if (!read_elf_header(pid, lib_base, ehdr)) {
@@ -115,33 +137,38 @@ static bool parse_dynamic_info(pid_t pid, uintptr_t lib_base, DynamicInfo& info)
 }
 
 //=============================================================================
-// Symbol iteration utilities (added to eliminate duplication)
+// Symbol iteration utilities
 //=============================================================================
 
-// Callback type: return false to stop iteration, true to continue
 using SymbolCallback = std::function<bool(const Elf64_Sym& sym, const std::string& name)>;
 
+/**
+ * @brief Iterate through all dynamic symbols using pre-parsed DynamicInfo
+ * @param pid Target process ID
+ * @param info DynamicInfo structure
+ * @param callback Called for each symbol (return false to stop)
+ * @return true if iteration completed
+ */
 static bool iterate_dynamic_symbols(pid_t pid, const DynamicInfo& info, const SymbolCallback& callback) {
     uint32_t nchain = 0;
 
-    // Determine number of symbols from hash table
     if (info.hash != 0) {
         uint32_t nbucket;
         if (!read_struct(pid, info.hash, nbucket) || !read_struct(pid, info.hash + 4, nchain))
             return false;
     } else if (info.gnu_hash != 0) {
         nchain = parse_gnu_hash(pid, info.gnu_hash);
-        if (nchain == 0) nchain = 10000; // fallback
+        if (nchain == 0) nchain = 10000;
     } else {
-        nchain = 10000; // fallback
+        nchain = 10000;
     }
 
     for (uint32_t i = 0; i < nchain; ++i) {
         Elf64_Sym sym;
         uintptr_t sym_addr = info.symtab + i * info.syment;
         if (!read_struct(pid, sym_addr, sym)) {
-            if (i > 0) break; // If we fail after first symbol, assume end of table
-            continue;          // If first symbol fails, maybe table is empty?
+            if (i > 0) break;
+            continue;
         }
 
         if (sym.st_name == 0) continue;
@@ -151,19 +178,25 @@ static bool iterate_dynamic_symbols(pid_t pid, const DynamicInfo& info, const Sy
         if (name.empty()) continue;
 
         if (!callback(sym, name)) {
-            break; // Stop if callback returns false
+            break;
         }
     }
 
     return true;
 }
 
+/**
+ * @brief Iterate through all dynamic symbols of a library
+ * @param pid Target process ID
+ * @param lib_base Base address of library
+ * @param callback Called for each symbol (return false to stop)
+ * @return true if iteration completed
+ */
 static bool iterate_dynamic_symbols(pid_t pid, uintptr_t lib_base, const SymbolCallback& callback) {
     DynamicInfo info;
     if (!parse_dynamic_info(pid, lib_base, info)) {
         LOG_DBG("iterate_dynamic_symbols: failed to parse dynamic info at 0x%lx", lib_base);
         return false;
     }
-    // Delegate to the version with pre-parsed info (lib_base not needed)
     return iterate_dynamic_symbols(pid, info, callback);
 }

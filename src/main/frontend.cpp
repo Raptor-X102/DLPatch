@@ -1,4 +1,8 @@
-// main.cpp
+//=============================================================================
+// frontend.cpp
+// Command-line interface entry point for the DL Manager tool
+//=============================================================================
+
 #include "frontend.hpp"
 #include <sys/capability.h>
 #include <iostream>
@@ -8,6 +12,12 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/**
+ * @brief Check if the process has CAP_SYS_PTRACE capability
+ * 
+ * Displays a warning if the capability is missing, as it's required
+ * to trace processes not started by this tool.
+ */
 static void check_ptrace_capability() {
     cap_t caps = cap_get_proc();
     if (!caps) {
@@ -37,6 +47,10 @@ static void check_ptrace_capability() {
     cap_free(caps);
 }
 
+/**
+ * @brief Print usage information
+ * @param prog Program name
+ */
 static void print_usage(const char *prog) {
     std::cerr << "Usage:\n"
               << "  " << prog << " list <pid>\n"
@@ -47,6 +61,14 @@ static void print_usage(const char *prog) {
               << "  " << prog << " status <pid>\n";
 }
 
+/**
+ * @brief Main entry point
+ * @param argc Argument count
+ * @param argv Argument vector
+ * @return 0 on success, 1 on error
+ * 
+ * Parses command line arguments and dispatches to appropriate Frontend methods.
+ */
 int main(int argc, char **argv) {
     if (argc < 3) {
         print_usage(argv[0]);
@@ -57,7 +79,8 @@ int main(int argc, char **argv) {
     pid_t pid = std::stoi(argv[2]);
 
     check_ptrace_capability();
-    // Check if process exists
+    
+    // Check if target process exists
     if (kill(pid, 0) != 0) {
         std::cerr << "Process " << pid << " does not exist.\n";
         return 1;

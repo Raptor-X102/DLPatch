@@ -1,6 +1,15 @@
+//=============================================================================
 // DL_Manager_cache.ipp
-#include <algorithm>
+// Cache management for parsed ELF symbols and GOT entries
+//=============================================================================
 
+/**
+ * @brief Ensure cache is populated for a given library
+ * @param lib_base Base address of the library
+ * 
+ * Checks if cache exists for this library and is valid.
+ * If not, parses dynamic information, symbols, and GOT entries.
+ */
 void DL_Manager::ensure_cache(uintptr_t lib_base) const {
     auto it = library_cache_.find(lib_base);
     if (it != library_cache_.end() && it->second.parsed)
@@ -25,6 +34,10 @@ void DL_Manager::ensure_cache(uintptr_t lib_base) const {
             lib_base, data.symbols.size(), data.got_entries.size());
 }
 
+/**
+ * @brief Invalidate cache for a specific library or all libraries
+ * @param lib_base Base address (0 = clear all)
+ */
 void DL_Manager::invalidate_cache(uintptr_t lib_base) {
     if (lib_base == 0) {
         library_cache_.clear();
@@ -35,6 +48,15 @@ void DL_Manager::invalidate_cache(uintptr_t lib_base) {
     }
 }
 
+/**
+ * @brief Parse all symbols from dynamic section
+ * @param lib_base Base address of library
+ * @param info Parsed dynamic section information
+ * @return Vector of SymbolInfo structures
+ * 
+ * Iterates through all dynamic symbols, filters out empty ones,
+ * and creates SymbolInfo entries with absolute addresses.
+ */
 std::vector<SymbolInfo> DL_Manager::parse_symbols_from_dynamic(uintptr_t lib_base,
                                                                 const DynamicInfo& info) const {
     std::vector<SymbolInfo> symbols;
@@ -58,6 +80,15 @@ std::vector<SymbolInfo> DL_Manager::parse_symbols_from_dynamic(uintptr_t lib_bas
     return symbols;
 }
 
+/**
+ * @brief Parse GOT (Global Offset Table) entries from PLT relocations
+ * @param lib_base Base address of library
+ * @param info Parsed dynamic section information
+ * @return Map from symbol name to GOT entry address
+ * 
+ * Reads PLT relocations (JUMP_SLOT) and maps them to symbol names.
+ * GOT entries are used for function address resolution and patching.
+ */
 std::map<std::string, uintptr_t> DL_Manager::parse_got_entries(uintptr_t lib_base,
                                                                 const DynamicInfo& info) const {
     std::map<std::string, uintptr_t> got_map;
@@ -70,6 +101,8 @@ std::map<std::string, uintptr_t> DL_Manager::parse_got_entries(uintptr_t lib_bas
         Elf64_Rela rela;
         uintptr_t rela_addr = info.jmprel + i * sizeof(Elf64_Rela);
         if (!read_struct(pid_, rela_addr, rela)) continue;
+        
+        // Only process JUMP_SLOT relocations (PLT entries)
         if (ELF64_R_TYPE(rela.r_info) != R_X86_64_JUMP_SLOT) continue;
 
         uint32_t sym_idx = ELF64_R_SYM(rela.r_info);

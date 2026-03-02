@@ -1,4 +1,8 @@
-// frontend.cpp
+//=============================================================================
+// frontend.ipp
+// Implementation of the Frontend class - user interface to DL_Manager
+//=============================================================================
+
 #include "frontend.hpp"
 #include "daemon.hpp"
 #include <iostream>
@@ -7,18 +11,36 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+//=============================================================================
+// Construction / Destruction
+//=============================================================================
+
+/**
+ * @brief Construct a new Frontend object
+ * @param pid Target process PID
+ * 
+ * Initializes DL_Manager and attempts to load saved state for this PID.
+ */
 Frontend::Frontend(pid_t pid) : pid_(pid), mgr_(pid) {
     state_path_ = get_state_path();
-    // Сначала загружаем состояние, оно установит библиотеки в mgr_
     bool state_loaded = load_state();
     if (state_loaded) {
         LOG_DBG("State loaded successfully for PID %d", pid_);
     } else {
         LOG_DBG("No state found for PID %d, starting fresh", pid_);
     }
-    // Трекер инициализируется при первом обращении к mgr_
 }
 
+//=============================================================================
+// State file management
+//=============================================================================
+
+/**
+ * @brief Get the path to the state file for this PID
+ * @return Full path to JSON state file
+ * 
+ * Creates ~/.dl_manager/state/ directory if it doesn't exist.
+ */
 std::string Frontend::get_state_path() const {
     const char* home = getenv("HOME");
     if (!home) {
@@ -36,6 +58,7 @@ std::string Frontend::get_state_path() const {
     std::string base_dir = std::string(home) + "/.dl_manager";
     std::string state_dir = base_dir + "/state";
     
+    // Create directories if they don't exist
     if (mkdir(base_dir.c_str(), 0700) != 0 && errno != EEXIST) {
         LOG_ERR("Failed to create directory %s: %s", base_dir.c_str(), strerror(errno));
     }
@@ -46,18 +69,33 @@ std::string Frontend::get_state_path() const {
     return state_dir + "/" + std::to_string(pid_) + ".json";
 }
 
+/**
+ * @brief Convert pointer to hex string for JSON serialization
+ * @param ptr Pointer value
+ * @return Hex string with "0x" prefix
+ */
 std::string Frontend::ptr_to_hex(uintptr_t ptr) {
     std::stringstream ss;
     ss << "0x" << std::hex << ptr;
     return ss.str();
 }
 
+/**
+ * @brief Convert hex string to pointer value
+ * @param hex Hex string (with or without "0x" prefix)
+ * @return Pointer value
+ */
 uintptr_t Frontend::hex_to_ptr(const std::string& hex) {
     if (hex.size() > 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X'))
         return std::stoull(hex.substr(2), nullptr, 16);
     return std::stoull(hex, nullptr, 16);
 }
 
+/**
+ * @brief Convert byte vector to hex string for JSON serialization
+ * @param bytes Vector of bytes
+ * @return Hex string without prefix
+ */
 std::string Frontend::bytes_to_hex(const std::vector<uint8_t>& bytes) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
@@ -66,6 +104,11 @@ std::string Frontend::bytes_to_hex(const std::vector<uint8_t>& bytes) {
     return ss.str();
 }
 
+/**
+ * @brief Convert hex string to byte vector
+ * @param hex Hex string (even length)
+ * @return Vector of bytes
+ */
 std::vector<uint8_t> Frontend::hex_to_bytes(const std::string& hex) {
     std::vector<uint8_t> bytes;
     for (size_t i = 0; i + 1 < hex.size(); i += 2)
@@ -73,6 +116,13 @@ std::vector<uint8_t> Frontend::hex_to_bytes(const std::string& hex) {
     return bytes;
 }
 
+/**
+ * @brief Save current state to JSON file
+ * @return true if save succeeded
+ * 
+ * Serializes tracked libraries, their status, and all backup data
+ * (GOT entries and JMP patch bytes) for later restoration.
+ */
 bool Frontend::save_state() const {
     std::string path = get_state_path();
     std::ofstream f(path);
@@ -131,6 +181,13 @@ bool Frontend::save_state() const {
     return true;
 }
 
+/**
+ * @brief Load state from JSON file
+ * @return true if load succeeded
+ * 
+ * Restores tracked libraries and all backup data from saved state.
+ * Creates normalized path aliases for reliable lookups.
+ */
 bool Frontend::load_state() {
     std::ifstream f(state_path_);
     if (!f.is_open()) {
@@ -146,7 +203,6 @@ bool Frontend::load_state() {
             return false;
         }
 
-        // Создаем временную карту для загруженных библиотек
         std::map<std::string, TrackedLibrary> loaded_libs;
 
         LOG_DBG("Loading state for PID %d", pid_);
@@ -184,10 +240,10 @@ bool Frontend::load_state() {
             LOG_DBG("    GOT backups: %zu", lib.saved_original_got.size());
             LOG_DBG("    JMP backups: %zu", lib.saved_original_bytes.size());
             
-            // Сохраняем по исходному пути
+            // Store by original path
             loaded_libs[lib.path] = lib;
             
-            // Также создаем нормализованную версию для поиска
+            // Also create normalized alias for lookups
             char resolved_path[PATH_MAX];
             if (realpath(lib.path.c_str(), resolved_path) != nullptr) {
                 std::string normalized = resolved_path;
@@ -198,7 +254,6 @@ bool Frontend::load_state() {
             }
         }
         
-        // Устанавливаем загруженные библиотеки в менеджер
         mgr_.set_tracked_libraries(loaded_libs);
         LOG_DBG("Loaded %zu libraries from state (with aliases: %zu total entries)", 
                  j["tracked_libraries"].size(), loaded_libs.size());
@@ -209,6 +264,16 @@ bool Frontend::load_state() {
     }
 }
 
+//=============================================================================
+// Daemon management
+//=============================================================================
+
+/**
+ * @brief Ensure the cleanup daemon is running
+ * @return true if daemon is running (or started successfully)
+ * 
+ * Forks and executes the daemon if it's not already running.
+ */
 bool Frontend::ensure_daemon_running() const {
     if (Daemon::is_running())
         return true;
@@ -223,6 +288,16 @@ bool Frontend::ensure_daemon_running() const {
     return Daemon::is_running();
 }
 
+//=============================================================================
+// Public command implementations
+//=============================================================================
+
+/**
+ * @brief List all loaded libraries in the target process
+ * @return true on success
+ * 
+ * Displays library paths and their status (original/replacement, active/inactive).
+ */
 bool Frontend::list_libraries() const {
     auto libs = mgr_.get_loaded_libraries();
     
@@ -248,14 +323,13 @@ bool Frontend::list_libraries() const {
             status = "unknown status";
         }
         
-        // Align output nicely
         std::cout << std::left << std::setw(60) << lib.path 
                   << " [" << status << "]\n";
     }
     
     std::cout << "----------------------------------------\n";
     
-    // Also show tracker contents for debugging
+    // Show tracker contents for debugging
     auto tracked = mgr_.get_tracked_libraries();
     std::cout << "\nTracker contents (" << tracked.size() << " libraries):\n";
     for (const auto& [path, lib] : tracked) {
@@ -266,6 +340,11 @@ bool Frontend::list_libraries() const {
     return true;
 }
 
+/**
+ * @brief List all exported functions in a library
+ * @param pattern Pattern to identify the library
+ * @return true on success
+ */
 bool Frontend::list_symbols(const std::string& pattern) const {
     LibraryInfo info = mgr_.get_library_info(pattern);
     if (info.base_addr == 0) {
@@ -286,6 +365,13 @@ bool Frontend::list_symbols(const std::string& pattern) const {
     return true;
 }
 
+/**
+ * @brief Replace a library in the target process
+ * @param target Target library pattern
+ * @param new_lib Path to new library
+ * @param func Function to patch ("all" for all functions)
+ * @return true if replacement succeeded
+ */
 bool Frontend::replace_library(const std::string& target, const std::string& new_lib, const std::string& func) {
     LOG_INFO("Replacing library: target=%s, new=%s, func=%s", 
              target.c_str(), new_lib.c_str(), func.c_str());
@@ -335,19 +421,23 @@ bool Frontend::replace_library(const std::string& target, const std::string& new
     return ok;
 }
 
+/**
+ * @brief Rollback all patches applied to a library
+ * @param lib Path to library
+ * @return true if rollback succeeded
+ */
 bool Frontend::rollback_library(const std::string& lib) {
     auto tracked = mgr_.get_tracked_libraries();
     
     LOG_DBG("Tracked libraries for PID %d:", pid_);
     
-    // Normalize the input path
     std::string search_normalized = normalize_path(lib);
     LOG_DBG("Searching for normalized path: %s", search_normalized.c_str());
     
     std::string found_path;
     TrackedLibrary* found_lib = nullptr;
     
-    for (auto& [path, lib_data] : tracked) {  // Используем ссылку, чтобы можно было передать в mgr_
+    for (auto& [path, lib_data] : tracked) {
         std::string path_normalized = normalize_path(path);
         
         LOG_DBG("  %s (norm=%s, GOT=%zu, JMP=%zu)", 
@@ -363,7 +453,6 @@ bool Frontend::rollback_library(const std::string& lib) {
             LOG_DBG("  GOT backups: %zu, JMP backups: %zu", 
                     lib_data.saved_original_got.size(), 
                     lib_data.saved_original_bytes.size());
-            // Не break, чтобы продолжить логирование всех библиотек
         }
     }
     
@@ -372,7 +461,6 @@ bool Frontend::rollback_library(const std::string& lib) {
         return false;
     }
     
-    // Проверяем, есть ли что откатывать
     if (found_lib->saved_original_got.empty() && found_lib->saved_original_bytes.empty()) {
         LOG_INFO("No patches to rollback for %s", found_path.c_str());
         return true;
@@ -388,10 +476,12 @@ bool Frontend::rollback_library(const std::string& lib) {
     return ok;
 }
 
-//=============================================================================
-// frontend.ipp - финальная версия rollback_function
-//=============================================================================
-
+/**
+ * @brief Rollback a single function patch
+ * @param lib Path to library
+ * @param func Function name
+ * @return true if rollback succeeded
+ */
 bool Frontend::rollback_function(const std::string& lib, const std::string& func) {
     auto tracked = mgr_.get_tracked_libraries();
     
@@ -402,7 +492,6 @@ bool Frontend::rollback_function(const std::string& lib, const std::string& func
         if (normalize_path(path) == search_norm) {
             found_path = path;
             
-            // Check if function exists in backups (always needed)
             bool has_got = (lib_data.saved_original_got.find(func) != lib_data.saved_original_got.end());
             bool has_jmp = (lib_data.saved_original_bytes.find(func) != lib_data.saved_original_bytes.end());
             
@@ -430,12 +519,22 @@ bool Frontend::rollback_function(const std::string& lib, const std::string& func
     return ok;
 }
 
+/**
+ * @brief Unload a library from the target process
+ * @param lib Path to library
+ * @return true if unload succeeded
+ * 
+ * Only non-original, inactive libraries can be unloaded.
+ */
 bool Frontend::unload_library(const std::string& lib) {
     bool ok = mgr_.unload_library(lib);
     if (ok) save_state();
     return ok;
 }
 
+/**
+ * @brief Print detailed status of tracked libraries
+ */
 void Frontend::print_status() const {
     auto libs = mgr_.get_tracked_libraries();
     if (libs.empty()) {

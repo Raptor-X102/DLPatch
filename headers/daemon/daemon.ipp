@@ -1,21 +1,20 @@
-#include "daemon.hpp"
-#include <iostream>
-#include <fstream>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <pwd.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <thread>
-#include <cstring>
-#include <nlohmann/json.hpp>
+//=============================================================================
+// daemon.ipp
+// Implementation of the cleanup daemon
+//=============================================================================
 
 using json = nlohmann::json;
 
-static Daemon* g_daemon = nullptr;
+static Daemon* g_daemon = nullptr;  // Global pointer for signal handler
 
+//=============================================================================
+// Internal helper functions
+//=============================================================================
+
+/**
+ * @brief Get user's home directory (from HOME env or passwd)
+ * @return Home directory path
+ */
 static std::string get_home_dir() {
     const char* home = getenv("HOME");
     if (home) return home;
@@ -23,6 +22,11 @@ static std::string get_home_dir() {
     return pw ? pw->pw_dir : ".";
 }
 
+/**
+ * @brief Ensure directory exists, create if necessary
+ * @param path Directory path
+ * @return true if directory exists or was created successfully
+ */
 static bool ensure_dir(const std::string& path) {
     struct stat st;
     if (stat(path.c_str(), &st) == 0) {
@@ -31,6 +35,11 @@ static bool ensure_dir(const std::string& path) {
     return mkdir(path.c_str(), 0700) == 0;
 }
 
+/**
+ * @brief Read entire file into string
+ * @param path File path
+ * @return File contents, empty string on error
+ */
 static std::string read_file(const std::string& path) {
     std::ifstream f(path);
     if (!f.is_open()) return "";
@@ -38,6 +47,12 @@ static std::string read_file(const std::string& path) {
                         std::istreambuf_iterator<char>());
 }
 
+/**
+ * @brief Write string to file
+ * @param path File path
+ * @param content Content to write
+ * @return true if write succeeded
+ */
 static bool write_file(const std::string& path, const std::string& content) {
     std::ofstream f(path);
     if (!f.is_open()) return false;
@@ -45,6 +60,14 @@ static bool write_file(const std::string& path, const std::string& content) {
     return f.good();
 }
 
+/**
+ * @brief Get process start time from /proc/[pid]/stat
+ * @param pid Process ID
+ * @return Start time in jiffies (field 21 in /proc/pid/stat)
+ * 
+ * Used to detect PID reuse - if start time differs, it's a different process
+ * even though the PID is the same.
+ */
 static unsigned long long get_process_starttime(pid_t pid) {
     std::string path = "/proc/" + std::to_string(pid) + "/stat";
     std::ifstream f(path);
@@ -53,6 +76,7 @@ static unsigned long long get_process_starttime(pid_t pid) {
     std::getline(f, line);
     f.close();
 
+    // Skip to field 21 (starttime)
     size_t pos = 0;
     int field = 0;
     while (field < 21 && pos < line.size()) {
@@ -64,6 +88,10 @@ static unsigned long long get_process_starttime(pid_t pid) {
     }
     return 0;
 }
+
+//=============================================================================
+// Daemon implementation
+//=============================================================================
 
 Daemon::Daemon() : running_(false), interval_(5) {
     home_dir_ = get_home_dir();
@@ -102,18 +130,23 @@ bool Daemon::start() {
 
     pid_t pid = fork();
     if (pid < 0) return false;
-    if (pid > 0) return true;
+    if (pid > 0) return true;  // Parent returns
 
-    // First child
+    // First child - create new session
     if (setsid() < 0) _exit(1);
+    
     pid = fork();
     if (pid < 0) _exit(1);
-    if (pid > 0) _exit(0);
+    if (pid > 0) _exit(0);  // First child exits, second child becomes daemon
 
     // Daemon process
     umask(0);
     chdir("/");
+    
+    // Close all file descriptors
     for (int fd = sysconf(_SC_OPEN_MAX); fd >= 0; --fd) close(fd);
+    
+    // Redirect stdin/stdout/stderr to /dev/null
     open("/dev/null", O_RDONLY);
     open("/dev/null", O_WRONLY);
     open("/dev/null", O_WRONLY);
@@ -170,9 +203,10 @@ void Daemon::cleanup_dead_processes() {
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
-        if (entry->d_type != DT_REG) continue;
+        if (entry->d_type != DT_REG) continue;  // Only regular files
+        
         std::string name = entry->d_name;
-        if (name.size() < 5 || name.substr(name.size()-5) != ".json") continue;
+        if (name.size() < 5 || name.substr(name.size() - 5) != ".json") continue;
 
         std::string full_path = get_state_dir() + "/" + name;
         std::string content = read_file(full_path);

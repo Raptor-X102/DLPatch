@@ -1,8 +1,24 @@
 //=============================================================================
-// Data structures
+// DL_Manager_types.hpp
+// Data structures used throughout the DL_Manager system
 //=============================================================================
 
-// Information about a loaded library
+#ifndef DL_MANAGER_TYPES_HPP
+#define DL_MANAGER_TYPES_HPP
+
+#include <string>
+#include <vector>
+#include <map>
+#include <cstdint>
+#include <sys/user.h>
+
+//=============================================================================
+// Library Information
+//=============================================================================
+
+/**
+ * @brief Information about a loaded library from /proc/pid/maps
+ */
 struct LibraryInfo {
     std::string path;    // Full path to the library file
     uintptr_t base_addr; // Base address where library is loaded
@@ -12,14 +28,12 @@ struct LibraryInfo {
     std::vector<std::pair<uintptr_t, uintptr_t>>
         segments; // Memory segments [start, end)
 
-    // Default constructor
     LibraryInfo()
         : base_addr(0)
         , size(0)
         , is_original(false)
         , is_active(false) {}
 
-    // Constructor with basic parameters
     LibraryInfo(const std::string &p, uintptr_t addr, size_t sz)
         : path(p)
         , base_addr(addr)
@@ -28,40 +42,65 @@ struct LibraryInfo {
         , is_active(false) {}
 };
 
+//=============================================================================
+// Thread Information
+//=============================================================================
+
+/**
+ * @brief Stack information for a thread (from /proc/pid/maps)
+ */
 struct StackInfo {
     uintptr_t start;
     uintptr_t end;
     size_t size;
+    
+    StackInfo() : start(0), end(0), size(0) {}
 };
 
-// Tracked library state with rollback data
-struct TrackedLibrary {
-    std::string path;                           // Library path (used as key)
-    uintptr_t handle;                           // Handle returned by dlopen
-    uintptr_t base_addr;                        // Base address in memory
-    std::vector<std::string> patched_functions; // Functions patched from other libraries
-    std::vector<std::string> provided_functions; // All functions this library exports
-    std::vector<std::string>
-        patched_libraries; // Libraries that were patched to point to this one
-    bool is_active;        // Whether this library is currently the target of any patch
-    bool is_original;      // Whether this is the original library (never unloaded)
-    std::map<std::string, std::vector<uint8_t>>
-        saved_original_bytes; // Original bytes for JMP patch rollback
-    std::map<std::string, uintptr_t>
-        saved_original_got; // Original GOT values for GOT patch rollback
+/**
+ * @brief Thread context with saved registers for restore after injection
+ */
+struct ThreadContext {
+    pid_t tid;                    // Thread ID
+    struct user_regs_struct regs; // Saved registers
+    
+    ThreadContext() : tid(0) {
+        memset(&regs, 0, sizeof(regs));
+    }
+};
 
-    // Fields for library identification
+//=============================================================================
+// Tracked Library State (for persistence and rollback)
+//=============================================================================
+
+/**
+ * @brief Complete state of a tracked library, including patch backups
+ */
+struct TrackedLibrary {
+    std::string path;                            // Library path (used as key)
+    uintptr_t handle;                            // Handle returned by dlopen
+    uintptr_t base_addr;                         // Base address in memory
+    std::vector<std::string> patched_functions;  // Functions patched from other libraries
+    std::vector<std::string> provided_functions; // All functions this library exports
+    std::vector<std::string> patched_libraries;  // Libraries that were patched to point to this one
+    bool is_active;                               // Whether this library is currently the target of any patch
+    bool is_original;                             // Whether this is the original library (never unloaded)
+    
+    // Backup data for rollback
+    std::map<std::string, std::vector<uint8_t>> saved_original_bytes; // Original bytes for JMP patch rollback
+    std::map<std::string, uintptr_t> saved_original_got;              // Original GOT values for GOT patch rollback
+
+    // File identification for change detection
     time_t mtime;     // File modification time
     size_t file_size; // File size
 
-    // Constructors
     TrackedLibrary()
         : handle(0)
         , base_addr(0)
         , is_active(false)
         , is_original(false)
-        , mtime(0)        // Явно инициализируем нулем
-        , file_size(0) {} // Явно инициализируем нулем
+        , mtime(0)
+        , file_size(0) {}
 
     TrackedLibrary(const std::string &p,
                    uintptr_t h,
@@ -72,8 +111,8 @@ struct TrackedLibrary {
         , base_addr(addr)
         , is_active(false)
         , is_original(false)
-        , mtime(0)       // Явно инициализируем нулем
-        , file_size(0) { // Явно инициализируем нулем
+        , mtime(0)
+        , file_size(0) {
         provided_functions.push_back(func);
     }
 
@@ -87,11 +126,17 @@ struct TrackedLibrary {
         , provided_functions(functions)
         , is_active(false)
         , is_original(false)
-        , mtime(0)        // Явно инициализируем нулем
-        , file_size(0) {} // Явно инициализируем нулем
+        , mtime(0)
+        , file_size(0) {}
 };
 
-// Symbol information
+//=============================================================================
+// ELF Symbol Information
+//=============================================================================
+
+/**
+ * @brief Information about an ELF symbol
+ */
 struct SymbolInfo {
     std::string name;
     uintptr_t addr;
@@ -114,13 +159,13 @@ struct SymbolInfo {
         , visibility(v) {}
 };
 
-// Thread context for stop/resume operations
-struct ThreadContext {
-    pid_t tid;                    // Thread ID
-    struct user_regs_struct regs; // Saved registers
-};
+//=============================================================================
+// ELF Dynamic Section Information
+//=============================================================================
 
-// Dynamic section information parsed from ELF
+/**
+ * @brief Parsed dynamic section information from ELF
+ */
 struct DynamicInfo {
     uintptr_t strtab = 0;     // DT_STRTAB - string table
     uintptr_t symtab = 0;     // DT_SYMTAB - symbol table
@@ -133,17 +178,28 @@ struct DynamicInfo {
     uintptr_t gnu_hash = 0;   // DT_GNU_HASH - GNU hash table
 };
 
-// Cache structure
+//=============================================================================
+// Cache Structure
+//=============================================================================
+
+/**
+ * @brief Cached data for a library (symbols and GOT entries)
+ */
 struct CachedLibraryData {
     std::vector<SymbolInfo> symbols;              // Cached symbols
     std::map<std::string, uintptr_t> got_entries; // Cached GOT entries by symbol name
     bool parsed;                                  // Whether cache is valid
 
-    // Constructor
-    CachedLibraryData()
-        : parsed(false) {}
+    CachedLibraryData() : parsed(false) {}
 };
 
+//=============================================================================
+// Result Enums
+//=============================================================================
+
+/**
+ * @brief Result of library load operation
+ */
 enum class LoadResult {
     NOT_FOUND,      // Library not found in tracker or maps
     CHANGED,        // File changed, needs reload
@@ -152,3 +208,5 @@ enum class LoadResult {
     ALREADY_ACTIVE, // Library already active and unchanged - nothing to do
     FAILED          // Failed to load library
 };
+
+#endif // DL_MANAGER_TYPES_HPP

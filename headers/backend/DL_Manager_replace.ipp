@@ -1,9 +1,18 @@
+//=============================================================================
 // DL_manager_replace.ipp
-
-//=============================================================================
-// Static helper functions 
+// Core implementation of library replacement logic
 //=============================================================================
 
+//=============================================================================
+// Static helper functions (always available, no debug dependencies)
+//=============================================================================
+
+/**
+ * @brief Log the start of a library replacement operation
+ * @param target Target library pattern/name
+ * @param new_lib Path to new library
+ * @param function Target function to patch ("all" for all functions)
+ */
 static void log_replacement_start(const std::string& target, const std::string& new_lib, const std::string& function) {
     LOG_RESULT("=== Starting library replacement ===");
     LOG_RESULT("Target pattern: %s", target.c_str());
@@ -11,6 +20,10 @@ static void log_replacement_start(const std::string& target, const std::string& 
     LOG_RESULT("Function: %s", function.c_str());
 }
 
+/**
+ * @brief Log the result of a library replacement operation
+ * @param success True if replacement succeeded, false otherwise
+ */
 static void log_replacement_result(bool success) {
     if (success) {
         LOG_RESULT("=== Library replacement completed successfully ===");
@@ -19,6 +32,13 @@ static void log_replacement_result(bool success) {
     }
 }
 
+/**
+ * @brief Check if required function addresses are initialized
+ * @param dlopen_addr Address of dlopen in target process
+ * @param dlclose_addr Address of dlclose in target process
+ * @param syscall_insn Address of syscall instruction in target process
+ * @return true if all addresses are non-zero
+ */
 static bool check_required_addresses(uintptr_t dlopen_addr, uintptr_t dlclose_addr, uintptr_t syscall_insn) {
     if (dlopen_addr == 0 || dlclose_addr == 0 || syscall_insn == 0) {
         LOG_ERR("Required addresses not initialized");
@@ -27,7 +47,11 @@ static bool check_required_addresses(uintptr_t dlopen_addr, uintptr_t dlclose_ad
     return true;
 }
 
-// Start cleanup daemon on first successful patch
+/**
+ * @brief Start the cleanup daemon on first successful patch
+ * 
+ * Ensures daemon is running only once to handle cleanup of unused libraries
+ */
 static void ensure_daemon_running() {
     static bool daemon_started = false;
     if (!daemon_started) {
@@ -38,10 +62,16 @@ static void ensure_daemon_running() {
     }
 }
 
-// ============================================================================
+//=============================================================================
 // DL_Manager implementation
-// ============================================================================
+//=============================================================================
 
+/**
+ * @brief Initialize addresses of dlopen, dlclose, and syscall in target process
+ * 
+ * Finds libc.so in target process and locates required symbols and instructions.
+ * These addresses are essential for remote code injection.
+ */
 void DL_Manager::init_addresses() {
     LibraryInfo libc_info = get_library_info("libc.so");
     if (libc_info.base_addr == 0) {
@@ -62,10 +92,25 @@ void DL_Manager::init_addresses() {
             dlopen_addr_, dlclose_addr_, syscall_insn_);
 }
 
+/**
+ * @brief Find syscall instruction address in libc
+ * @param libc_base Base address of libc in target process
+ * @return Address of syscall instruction or 0 if not found
+ * 
+ * Delegates to architecture-specific implementation.
+ */
 uintptr_t DL_Manager::find_syscall_instruction(uintptr_t libc_base) {
     return Arch::find_syscall_instruction(this, libc_base);
 }
 
+/**
+ * @brief Test remote syscall mechanism by executing SYS_GETPID
+ * @param tid Thread ID to execute syscall in
+ * @return true if syscall executed successfully
+ * 
+ * Used to verify that the remote syscall mechanism works before attempting
+ * to load libraries.
+ */
 bool DL_Manager::test_syscall(pid_t tid) {
     if (syscall_insn_ == 0) return false;
     
@@ -87,6 +132,14 @@ bool DL_Manager::test_syscall(pid_t tid) {
     return true;
 }
 
+/**
+ * @brief Validate that target library exists in process memory
+ * @param target_lib_pattern Pattern to search for in /proc/pid/maps
+ * @param target_info [out] Filled with library information
+ * @param clean_path [out] Cleaned path (without leading spaces)
+ * @param normalized_path [out] Normalized absolute path
+ * @return true if library found and info populated
+ */
 bool DL_Manager::validate_target_library(const std::string& target_lib_pattern, 
                                           LibraryInfo& target_info,
                                           std::string& clean_path,
@@ -103,6 +156,16 @@ bool DL_Manager::validate_target_library(const std::string& target_lib_pattern,
     return true;
 }
 
+/**
+ * @brief Check if it's safe to replace the target library
+ * @param normalized_target Normalized path of target library
+ * @param target_mtime File modification time
+ * @param target_size File size
+ * @param target_info_ok Whether file info was successfully obtained
+ * @return true if safe to proceed
+ * 
+ * Updates file info in tracker if changed and logs warnings about active status.
+ */
 bool DL_Manager::check_target_safety(const std::string& normalized_target,
                                       time_t target_mtime,
                                       size_t target_size,
@@ -136,6 +199,24 @@ bool DL_Manager::check_target_safety(const std::string& normalized_target,
 //=============================================================================
 // Main replacement function 
 //=============================================================================
+
+/**
+ * @brief Replace target library with new library in the target process
+ * @param target_lib_pattern Pattern to identify target library (e.g., "libc.so" or full path)
+ * @param new_lib_path Path to the new library file to load
+ * @param target_function Function to patch ("all" for all functions, or specific function name)
+ * @return true if replacement succeeded, false otherwise
+ * 
+ * This is the main entry point for library replacement. The function:
+ * 1. Validates target library exists in process memory
+ * 2. Checks if replacement is safe (threads not using the library)
+ * 3. Freezes all threads outside the target library
+ * 4. Loads the new library via remote code injection
+ * 5. Applies patches (JMP or GOT) to redirect functions from old to new library
+ * 6. Updates tracker state and saves state to disk
+ * 7. Starts cleanup daemon if needed
+ * 8. Restores threads and resumes execution
+ */
 bool DL_Manager::replace_library(const std::string& target_lib_pattern,
                                   const std::string& new_lib_path,
                                   const std::string& target_function) {
@@ -162,9 +243,8 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     time_t target_mtime = 0, new_mtime = 0;
     size_t target_size = 0, new_size = 0;
     bool target_info_ok = get_file_info(clean_target_path, target_mtime, target_size);
-    
-    // Only get new file info if we need it for change detection
-    // check_library_state will get it again if needed, but we need it for logging
+
+    // Get new file info - for logging and state checking
 #ifdef DEBUG
     bool new_info_ok = get_file_info(new_lib_path, new_mtime, new_size);
     LOG_DBG("Target file: path=%s, ok=%d, mtime=%ld, size=%zu", 
@@ -172,10 +252,9 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     LOG_DBG("New file: path=%s, ok=%d, mtime=%ld, size=%zu", 
             new_lib_path.c_str(), new_info_ok, new_mtime, new_size);
 #else
-    // In release builds, we only need new file info if we're going to load it
-    // Let check_library_state handle it when needed
-    (void)new_mtime;
-    (void)new_size;
+    // In release builds, we still need the file info for check_library_state
+    // but we don't need to store the return value separately
+    get_file_info(new_lib_path, new_mtime, new_size);
 #endif
 
     // Check if target is safe to replace
@@ -228,11 +307,9 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-#ifdef DEBUG
     LOG_DBG("Prepared IP=0x%llx, SP=0x%llx", 
             (unsigned long long)Arch::get_ip(prepared_regs), 
             (unsigned long long)Arch::get_sp(prepared_regs));
-#endif
 
     struct user_regs_struct saved_regs = prepared_regs;
 

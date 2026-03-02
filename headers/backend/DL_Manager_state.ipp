@@ -1,3 +1,22 @@
+//=============================================================================
+// DL_Manager_state.ipp
+// Library state evaluation and change detection
+//=============================================================================
+
+/**
+ * @brief Check the current state of a library in the tracker and on disk
+ * @param lib_path Path to the library
+ * @param base [out] Base address if found
+ * @param handle [out] Handle if found in tracker
+ * @param check_active_only If true, also check if library is already active
+ * @return LoadResult indicating the state:
+ *         - NOT_FOUND: Library not in tracker or maps
+ *         - CHANGED: File has changed, needs reload
+ *         - LOADED_NEW: New copy loaded (used internally)
+ *         - USED_EXISTING: Existing copy can be used
+ *         - ALREADY_ACTIVE: Library already active and unchanged
+ *         - FAILED: Error occurred
+ */
 LoadResult DL_Manager::check_library_state(const std::string& lib_path,
                                             uintptr_t& base, 
                                             uintptr_t& handle,
@@ -6,7 +25,7 @@ LoadResult DL_Manager::check_library_state(const std::string& lib_path,
     
     LOG_DBG("check_library_state: %s", lib_path.c_str());
     
-    // Get current file info
+    // Get current file info from disk
     time_t current_mtime = 0;
     size_t current_size = 0;
     bool file_info_ok = get_file_info(lib_path, current_mtime, current_size);
@@ -30,7 +49,7 @@ LoadResult DL_Manager::check_library_state(const std::string& lib_path,
     LOG_DBG("  in tracker: base=0x%lx, handle=0x%lx, active=%d, mtime=%ld, size=%zu",
             lib.base_addr, lib.handle, lib.is_active, lib.mtime, lib.file_size);
     
-    // Check if file changed
+    // Check if file has changed on disk
     bool file_changed = false;
     if (file_info_ok && lib.file_size != 0) {
         if (lib.file_size != current_size) {
@@ -70,6 +89,21 @@ LoadResult DL_Manager::check_library_state(const std::string& lib_path,
     return LoadResult::USED_EXISTING;
 }
 
+/**
+ * @brief Ensure a new library is loaded in the target process
+ * @param tid Thread ID for injection
+ * @param new_lib_path Path to library to load
+ * @param new_lib_base [out] Base address of loaded library
+ * @param new_handle [out] Handle from dlopen
+ * @param saved_regs Saved registers of worker thread
+ * @return LoadResult indicating result of load operation
+ * 
+ * Handles multiple cases:
+ * 1. Library not loaded anywhere -> load fresh copy
+ * 2. Library in tracker and unchanged -> use existing
+ * 3. Library in tracker but changed -> reload
+ * 4. Library in maps but not tracked -> load our own copy
+ */
 LoadResult DL_Manager::ensure_new_library_loaded(pid_t tid,
                                                   const std::string& new_lib_path,
                                                   uintptr_t& new_lib_base,
@@ -191,6 +225,15 @@ LoadResult DL_Manager::ensure_new_library_loaded(pid_t tid,
     return LoadResult::FAILED;
 }
 
+/**
+ * @brief Check preconditions before library replacement
+ * @param target_lib_pattern Pattern to identify target library
+ * @return true if all preconditions are met
+ * 
+ * Checks:
+ * 1. It's safe to replace (no threads using the library)
+ * 2. Required addresses (dlopen, dlclose, syscall) are initialized
+ */
 bool DL_Manager::check_preconditions(const std::string& target_lib_pattern) {
     if (!is_safe_to_replace(target_lib_pattern)) {
         LOG_ERR("Not safe to replace library: threads are using it");

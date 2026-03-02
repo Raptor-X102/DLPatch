@@ -1,12 +1,17 @@
+//=============================================================================
 // DL_Manager_extract_funcs_from_lib.ipp
-#include <cstdio>
-#include <elf.h>
-#include <sys/uio.h>
-#include <vector>
-#include <cstring>
-#include <iostream>
-#include <cxxabi.h>
+// Symbol extraction and filtering
+//=============================================================================
 
+/**
+ * @brief Find a symbol directly without using cache
+ * @param lib_base Base address of library
+ * @param sym_name Symbol name to find
+ * @return Pointer to new SymbolInfo (caller must delete) or nullptr
+ * 
+ * This is a slower direct lookup used for one-off symbol queries.
+ * For repeated lookups, use cache and get_function_symbols.
+ */
 const SymbolInfo* DL_Manager::find_symbol_direct(uintptr_t lib_base, const std::string& sym_name) const {
     const SymbolInfo* result = nullptr;
 
@@ -25,6 +30,18 @@ const SymbolInfo* DL_Manager::find_symbol_direct(uintptr_t lib_base, const std::
     return result;
 }
 
+/**
+ * @brief Check if a symbol is a patchable exported function
+ * @param sym Symbol information
+ * @return true if function can be patched, false otherwise
+ * 
+ * Criteria for patchable functions:
+ * - Must be a function (STT_FUNC)
+ * - Must have non-zero size (has real code, not PLT stub)
+ * - Must be global or weak (exported)
+ * - Must have default visibility (not hidden)
+ * - Should not be C++ internal runtime symbols
+ */
 bool DL_Manager::is_exported_function(const SymbolInfo& sym) const {
     // Basic ELF checks for patchable functions
     if (sym.type != STT_FUNC) return false;                          // Must be a function
@@ -52,6 +69,13 @@ bool DL_Manager::is_exported_function(const SymbolInfo& sym) const {
     return true;
 }
 
+/**
+ * @brief Get all patchable function symbols from a library
+ * @param lib_base Base address of library
+ * @return Vector of SymbolInfo for patchable functions
+ * 
+ * Uses cache for efficiency. Filters symbols through is_exported_function.
+ */
 std::vector<SymbolInfo> DL_Manager::get_function_symbols(uintptr_t lib_base) const {
     // Ensure cache is populated for this library
     ensure_cache(lib_base);
@@ -68,6 +92,12 @@ std::vector<SymbolInfo> DL_Manager::get_function_symbols(uintptr_t lib_base) con
     return result;
 }
 
+/**
+ * @brief Get address of a symbol
+ * @param lib_base Base address of library
+ * @param sym_name Symbol name
+ * @return Absolute address of symbol, or 0 if not found
+ */
 uintptr_t DL_Manager::get_symbol_address(uintptr_t lib_base, const std::string& sym_name) const {
     const SymbolInfo* sym = find_symbol_direct(lib_base, sym_name);
     if (!sym) return 0;
@@ -77,6 +107,12 @@ uintptr_t DL_Manager::get_symbol_address(uintptr_t lib_base, const std::string& 
     return addr;
 }
 
+/**
+ * @brief Get size of a symbol
+ * @param lib_base Base address of library
+ * @param sym_name Symbol name
+ * @return Size of symbol in bytes, or 0 if not found
+ */
 size_t DL_Manager::get_symbol_size(uintptr_t lib_base, const std::string& sym_name) const {
     const SymbolInfo* sym = find_symbol_direct(lib_base, sym_name);
     if (!sym) return 0;
