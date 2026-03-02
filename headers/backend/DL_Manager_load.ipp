@@ -76,7 +76,7 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
         remote_munmap(pid_, remote_mem, REMOTE_MEM_SIZE, syscall_insn_);
         return 0;
     }
-    LOG_INFO("Library path written to remote memory");
+    LOG_DBG("Library path written to remote memory");
 
 #ifdef DEBUG
     // Verify path was written correctly
@@ -112,7 +112,7 @@ uintptr_t DL_Manager::load_new_library(pid_t tid, const std::string& lib_path,
         return 0;
     }
 
-    LOG_INFO("New library loaded: base=0x%lx, handle=0x%lx", new_lib_base, out_handle);
+    LOG_DBG("New library loaded: base=0x%lx, handle=0x%lx", new_lib_base, out_handle);
     return new_lib_base;
 }
 
@@ -198,7 +198,7 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
         if (sig == SIGTRAP) {
             // Shellcode completed successfully, read dlclose result
             if (read_remote_memory(tid, result_addr, &dlclose_result, sizeof(dlclose_result))) {
-                LOG_INFO("dlclose returned %lu", dlclose_result);
+                LOG_DBG("dlclose returned %lu", dlclose_result);
                 success = (dlclose_result == 0);  // dlclose returns 0 on success
             } else {
                 LOG_ERR("Failed to read dlclose result");

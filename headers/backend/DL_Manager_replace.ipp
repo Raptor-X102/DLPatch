@@ -109,7 +109,7 @@ bool DL_Manager::check_target_safety(const std::string& normalized_target,
                                       bool target_info_ok) {
     auto target_it = tracked_libraries_.find(normalized_target);
     if (target_it == tracked_libraries_.end()) {
-        LOG_INFO("Target library not in tracker - assuming it's safe to replace");
+        LOG_DBG("Target library not in tracker - assuming it's safe to replace");
         return true;
     }
 

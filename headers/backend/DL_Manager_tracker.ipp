@@ -49,19 +49,27 @@ void DL_Manager::ensure_target_in_tracker(const std::string& normalized_target,
         return;
     }
     
+#ifdef DEBUG
     LOG_DBG("Adding target to tracker: path=%s, base=0x%lx, mtime=%ld, size=%zu, info_ok=%d",
             clean_path.c_str(), target_base, target_mtime, target_size, target_info_ok);
+#else
+    // Suppress unused parameter warning in release builds
+    (void)clean_path;
+#endif
     
     // Add as original library
     TrackedLibrary target_lib(normalized_target, 0, target_base, std::vector<std::string>());
     target_lib.is_original = true;
     
-    // Store file info - if get_file_info failed, store 0 (not max values!)
+    // Store file info - if get_file_info failed, store 0
     target_lib.mtime = target_info_ok ? target_mtime : 0;
     target_lib.file_size = target_info_ok ? target_size : 0;
     
     tracked_libraries_[normalized_target] = target_lib;
-    LOG_INFO("Added target library to tracker: %s", clean_path.c_str());
+    
+#ifdef DEBUG
+    LOG_DBG("Added target library to tracker: %s", clean_path.c_str());
+#endif
 }
 
 void DL_Manager::print_library_tracker() const {

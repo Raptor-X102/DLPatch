@@ -63,7 +63,7 @@ std::vector<SymbolInfo> DL_Manager::get_function_symbols(uintptr_t lib_base) con
         }
     }
     
-    LOG_INFO("Found %zu patchable functions out of %zu total symbols", 
+    LOG_DBG("Found %zu patchable functions out of %zu total symbols", 
              result.size(), library_cache_[lib_base].symbols.size());
     return result;
 }

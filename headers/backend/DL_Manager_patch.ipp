@@ -14,7 +14,7 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
 
     // GOT patch path - for small functions
     if (old_func_size < THRESHOLD) {
-        LOG_INFO("Patching %s via GOT (function size: %zu bytes)", 
+        LOG_DBG("Patching %s via GOT (function size: %zu bytes)", 
                  func_name.c_str(), old_func_size);
         
         uintptr_t got_entry = find_got_entry(target_lib.base_addr, func_name);
@@ -89,7 +89,7 @@ bool DL_Manager::apply_all_patches(pid_t tid,
     if (target_function == "all") {
         // Get all exported functions from old library
         auto old_symbols = get_function_symbols(old_base);
-        LOG_INFO("Found %zu exported functions in old library", old_symbols.size());
+        LOG_DBG("Found %zu exported functions in old library", old_symbols.size());
         
         std::vector<std::string> patched_functions;
         
@@ -110,7 +110,7 @@ bool DL_Manager::apply_all_patches(pid_t tid,
             
             // Apply patch if addresses differ
             if (old_func_addr != new_func_addr) {
-                LOG_INFO("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
+                LOG_DBG("Patching %s: 0x%lx -> 0x%lx (size=%zu)", 
                          func_name.c_str(), old_func_addr, new_func_addr, sym.size);
                 
                 if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name)) {

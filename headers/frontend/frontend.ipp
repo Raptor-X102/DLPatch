@@ -12,7 +12,7 @@ Frontend::Frontend(pid_t pid) : pid_(pid), mgr_(pid) {
     // Сначала загружаем состояние, оно установит библиотеки в mgr_
     bool state_loaded = load_state();
     if (state_loaded) {
-        LOG_INFO("State loaded successfully for PID %d", pid_);
+        LOG_DBG("State loaded successfully for PID %d", pid_);
     } else {
         LOG_DBG("No state found for PID %d, starting fresh", pid_);
     }
@@ -87,7 +87,7 @@ bool Frontend::save_state() const {
     j["tracked_libraries"] = json::array();
 
     auto libs = mgr_.get_tracked_libraries();
-    LOG_INFO("Saving state for PID %d with %zu libraries", pid_, libs.size());
+    LOG_DBG("Saving state for PID %d with %zu libraries", pid_, libs.size());
     
     for (const auto& [path, lib] : libs) {
         json item;
@@ -127,7 +127,7 @@ bool Frontend::save_state() const {
         return false;
     }
     
-    LOG_INFO("State saved to %s", path.c_str());
+    LOG_DBG("State saved to %s", path.c_str());
     return true;
 }
 
@@ -149,7 +149,7 @@ bool Frontend::load_state() {
         // Создаем временную карту для загруженных библиотек
         std::map<std::string, TrackedLibrary> loaded_libs;
 
-        LOG_INFO("Loading state for PID %d", pid_);
+        LOG_DBG("Loading state for PID %d", pid_);
         
         for (const auto& item : j["tracked_libraries"]) {
             TrackedLibrary lib;
@@ -200,7 +200,7 @@ bool Frontend::load_state() {
         
         // Устанавливаем загруженные библиотеки в менеджер
         mgr_.set_tracked_libraries(loaded_libs);
-        LOG_INFO("Loaded %zu libraries from state (with aliases: %zu total entries)", 
+        LOG_DBG("Loaded %zu libraries from state (with aliases: %zu total entries)", 
                  j["tracked_libraries"].size(), loaded_libs.size());
         return true;
     } catch (const std::exception& e) {
@@ -293,41 +293,41 @@ bool Frontend::replace_library(const std::string& target, const std::string& new
     bool ok = mgr_.replace_library(target, new_lib, func);
     
     if (ok) {
-        // After successful replacement, check what was saved
-        auto tracked = mgr_.get_tracked_libraries();
+        LOG_INFO("Replacement successful.");
         
-        // Normalize paths for lookup
+#ifdef DEBUG
+        // Debug-only detailed backup information
+        auto tracked = mgr_.get_tracked_libraries();
         std::string target_norm = normalize_path(target);
         std::string new_norm = normalize_path(new_lib);
         
-        LOG_INFO("Replacement successful. Checking saved backup data:");
+        LOG_DBG("Checking saved backup data:");
         
-        // Check target library (original)
         auto target_it = tracked.find(target_norm);
         if (target_it != tracked.end()) {
-            LOG_INFO("  Target library %s:", target_norm.c_str());
-            LOG_INFO("    GOT backups: %zu", target_it->second.saved_original_got.size());
-            LOG_INFO("    JMP backups: %zu", target_it->second.saved_original_bytes.size());
+            LOG_DBG("  Target library %s:", target_norm.c_str());
+            LOG_DBG("    GOT backups: %zu", target_it->second.saved_original_got.size());
+            LOG_DBG("    JMP backups: %zu", target_it->second.saved_original_bytes.size());
             
             for (const auto& [fname, val] : target_it->second.saved_original_got) {
-                LOG_INFO("      GOT: %s -> 0x%lx", fname.c_str(), val);
+                LOG_DBG("      GOT: %s -> 0x%lx", fname.c_str(), val);
             }
             for (const auto& [fname, bytes] : target_it->second.saved_original_bytes) {
-                LOG_INFO("      JMP: %s (%zu bytes)", fname.c_str(), bytes.size());
+                LOG_DBG("      JMP: %s (%zu bytes)", fname.c_str(), bytes.size());
             }
         }
         
-        // Check new library (patched version)
         auto new_it = tracked.find(new_norm);
         if (new_it != tracked.end()) {
-            LOG_INFO("  New library %s:", new_norm.c_str());
-            LOG_INFO("    is_active: %d", new_it->second.is_active);
-            LOG_INFO("    patched_functions: %zu", new_it->second.patched_functions.size());
+            LOG_DBG("  New library %s:", new_norm.c_str());
+            LOG_DBG("    is_active: %d", new_it->second.is_active);
+            LOG_DBG("    patched_functions: %zu", new_it->second.patched_functions.size());
         }
+#endif
         
         save_state();
         ensure_daemon_running();
-        LOG_INFO("State saved after replacement");
+        LOG_DBG("State saved after replacement");
     } else {
         LOG_ERR("Replacement failed");
     }
