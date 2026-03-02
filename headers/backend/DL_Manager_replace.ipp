@@ -162,12 +162,21 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     time_t target_mtime = 0, new_mtime = 0;
     size_t target_size = 0, new_size = 0;
     bool target_info_ok = get_file_info(clean_target_path, target_mtime, target_size);
+    
+    // Only get new file info if we need it for change detection
+    // check_library_state will get it again if needed, but we need it for logging
+#ifdef DEBUG
     bool new_info_ok = get_file_info(new_lib_path, new_mtime, new_size);
-
     LOG_DBG("Target file: path=%s, ok=%d, mtime=%ld, size=%zu", 
             clean_target_path.c_str(), target_info_ok, target_mtime, target_size);
     LOG_DBG("New file: path=%s, ok=%d, mtime=%ld, size=%zu", 
             new_lib_path.c_str(), new_info_ok, new_mtime, new_size);
+#else
+    // In release builds, we only need new file info if we're going to load it
+    // Let check_library_state handle it when needed
+    (void)new_mtime;
+    (void)new_size;
+#endif
 
     // Check if target is safe to replace
     if (!check_target_safety(normalized_target, target_mtime, target_size, target_info_ok)) {
@@ -219,9 +228,11 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
+#ifdef DEBUG
     LOG_DBG("Prepared IP=0x%llx, SP=0x%llx", 
             (unsigned long long)Arch::get_ip(prepared_regs), 
             (unsigned long long)Arch::get_sp(prepared_regs));
+#endif
 
     struct user_regs_struct saved_regs = prepared_regs;
 
@@ -257,7 +268,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         
         if (patch_success) {
             // Update tracker state - only new library is active now, original becomes inactive
-            update_active_status(normalized_target, normalized_new);  // <- Changed from old version
+            update_active_status(normalized_target, normalized_new);
             record_patched_library(normalized_new, target_info.path);
             
             // Clean up old libraries

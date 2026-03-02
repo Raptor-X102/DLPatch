@@ -335,39 +335,47 @@ bool Frontend::replace_library(const std::string& target, const std::string& new
     return ok;
 }
 
-// headers/frontend/frontend.ipp - исправление с отладкой
 bool Frontend::rollback_library(const std::string& lib) {
     auto tracked = mgr_.get_tracked_libraries();
     
     LOG_DBG("Tracked libraries for PID %d:", pid_);
-    for (const auto& [path, lib_data] : tracked) {
-        LOG_DBG("  %s (GOT=%zu, JMP=%zu)", 
-                path.c_str(), 
-                lib_data.saved_original_got.size(), 
-                lib_data.saved_original_bytes.size());
-    }
     
     // Normalize the input path
     std::string search_normalized = normalize_path(lib);
     LOG_DBG("Searching for normalized path: %s", search_normalized.c_str());
     
     std::string found_path;
-    for (const auto& [path, lib_data] : tracked) {
+    TrackedLibrary* found_lib = nullptr;
+    
+    for (auto& [path, lib_data] : tracked) {  // Используем ссылку, чтобы можно было передать в mgr_
         std::string path_normalized = normalize_path(path);
+        
+        LOG_DBG("  %s (norm=%s, GOT=%zu, JMP=%zu)", 
+                path.c_str(), 
+                path_normalized.c_str(),
+                lib_data.saved_original_got.size(), 
+                lib_data.saved_original_bytes.size());
+        
         if (path_normalized == search_normalized) {
             found_path = path;
-            LOG_DBG("Found matching library: %s (normalized: %s)", 
-                    path.c_str(), path_normalized.c_str());
+            found_lib = &lib_data;
+            LOG_DBG("Found matching library: %s", path.c_str());
             LOG_DBG("  GOT backups: %zu, JMP backups: %zu", 
                     lib_data.saved_original_got.size(), 
                     lib_data.saved_original_bytes.size());
-            break;
+            // Не break, чтобы продолжить логирование всех библиотек
         }
     }
     
-    if (found_path.empty()) {
+    if (!found_lib) {
         LOG_ERR("Library not found in tracker: %s", lib.c_str());
         return false;
+    }
+    
+    // Проверяем, есть ли что откатывать
+    if (found_lib->saved_original_got.empty() && found_lib->saved_original_bytes.empty()) {
+        LOG_INFO("No patches to rollback for %s", found_path.c_str());
+        return true;
     }
     
     bool ok = mgr_.rollback_library(found_path);
@@ -380,29 +388,21 @@ bool Frontend::rollback_library(const std::string& lib) {
     return ok;
 }
 
+//=============================================================================
+// frontend.ipp - финальная версия rollback_function
+//=============================================================================
+
 bool Frontend::rollback_function(const std::string& lib, const std::string& func) {
     auto tracked = mgr_.get_tracked_libraries();
     
-    LOG_DBG("Tracked libraries for PID %d:", pid_);
-    for (const auto& [path, lib_data] : tracked) {
-        LOG_DBG("  %s (GOT=%zu, JMP=%zu)", 
-                path.c_str(), 
-                lib_data.saved_original_got.size(), 
-                lib_data.saved_original_bytes.size());
-    }
-    
-    // Normalize the input path
-    std::string search_normalized = normalize_path(lib);
-    LOG_DBG("Searching for normalized path: %s", search_normalized.c_str());
-    
+    std::string search_norm = normalize_path(lib);
     std::string found_path;
+    
     for (const auto& [path, lib_data] : tracked) {
-        std::string path_normalized = normalize_path(path);
-        if (path_normalized == search_normalized) {
+        if (normalize_path(path) == search_norm) {
             found_path = path;
-            LOG_DBG("Found matching library: %s", path.c_str());
             
-            // Check if function exists in backups
+            // Check if function exists in backups (always needed)
             bool has_got = (lib_data.saved_original_got.find(func) != lib_data.saved_original_got.end());
             bool has_jmp = (lib_data.saved_original_bytes.find(func) != lib_data.saved_original_bytes.end());
             

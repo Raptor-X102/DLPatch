@@ -1,7 +1,5 @@
 // DL_Manager_rollback.ipp
 
-void resume_all_threads(const std::vector<pid_t>& tids);
-
 bool DL_Manager::rollback_library(const std::string& lib_path) {
     std::string normalized = normalize_path(lib_path);
     LOG_INFO("Attempting to rollback library: %s", normalized.c_str());
@@ -17,23 +15,38 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
     LOG_DBG("Library %s has GOT backups: %zu, JMP backups: %zu", 
             lib.path.c_str(), lib.saved_original_got.size(), lib.saved_original_bytes.size());
 
-    // If no backups, nothing to rollback
     if (lib.saved_original_got.empty() && lib.saved_original_bytes.empty()) {
         LOG_INFO("No patches found for %s, nothing to rollback", lib.path.c_str());
         return true;
     }
 
-    pid_t main_tid;
-    struct user_regs_struct saved_regs;
-    std::vector<pid_t> tids = stop_threads_and_prepare_main(main_tid, saved_regs);
-    if (tids.empty()) {
-        LOG_ERR("Failed to stop threads for rollback");
+    // Get library info to obtain segments for thread safety check
+    LibraryInfo lib_info = get_library_info(lib_path);
+    if (lib_info.base_addr == 0) {
+        LOG_ERR("Failed to get library info for %s", lib_path.c_str());
         return false;
     }
 
+    // Get all threads
+    std::vector<pid_t> all_tids = get_all_threads(pid_);
+    if (all_tids.empty()) {
+        LOG_ERR("No threads found - process may have terminated");
+        return false;
+    }
+
+    // Freeze threads outside this library
+    std::vector<ThreadContext> contexts;
+    if (!freeze_threads_outside_library(all_tids, lib_info.segments, contexts)) {
+        LOG_ERR("Failed to freeze threads for rollback");
+        return false;
+    }
+
+    // Use first thread as worker (any stopped thread is fine for memory writes)
+    pid_t worker_tid = contexts[0].tid;
+
     bool all_ok = true;
     int restored_count = 0;
-    std::string replacement_lib_path;  // Path to the replacement library (to deactivate)
+    std::string replacement_lib_path;
 
     // Find the replacement library (active non-original library different from current one)
     for (const auto& [path, l] : tracked_libraries_) {
@@ -54,7 +67,7 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
             continue;
         }
         
-        if (!write_remote_memory(main_tid, got_entry, &p.second, sizeof(p.second))) {
+        if (!write_remote_memory(worker_tid, got_entry, &p.second, sizeof(p.second))) {
             LOG_ERR("Failed to restore GOT for %s", p.first.c_str());
             all_ok = false;
             continue;
@@ -75,7 +88,7 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
             continue;
         }
         
-        if (!write_remote_memory(main_tid, func_addr, p.second.data(), p.second.size())) {
+        if (!write_remote_memory(worker_tid, func_addr, p.second.data(), p.second.size())) {
             LOG_ERR("Failed to restore JMP for %s", p.first.c_str());
             all_ok = false;
             continue;
@@ -86,15 +99,10 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
     }
 
     if (all_ok && restored_count > 0) {
-        // Clear backups after successful restoration
         lib.saved_original_got.clear();
         lib.saved_original_bytes.clear();
-        
-        // Update statuses:
-        // 1. Current library (original) becomes active
         lib.is_active = true;
         
-        // 2. Replacement library becomes inactive (if found)
         if (!replacement_lib_path.empty()) {
             auto replacement_it = tracked_libraries_.find(replacement_lib_path);
             if (replacement_it != tracked_libraries_.end()) {
@@ -111,7 +119,7 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
                 restored_count, lib.saved_original_got.size() + lib.saved_original_bytes.size());
     }
 
-    resume_all_threads(tids);
+    restore_and_detach_all(contexts);
     return all_ok;
 }
 
@@ -127,34 +135,44 @@ bool DL_Manager::rollback_function(const std::string& lib_path, const std::strin
 
     TrackedLibrary& lib = it->second;
 
-    // Check if function exists in either backup
     bool has_got = (lib.saved_original_got.find(func_name) != lib.saved_original_got.end());
     bool has_jmp = (lib.saved_original_bytes.find(func_name) != lib.saved_original_bytes.end());
     
     if (!has_got && !has_jmp) {
         LOG_INFO("No backups found for function %s in %s", func_name.c_str(), lib_path.c_str());
-        return true;  // Already in desired state
+        return true;
     }
 
-    pid_t main_tid;
-    struct user_regs_struct saved_regs;
-    std::vector<pid_t> tids = stop_threads_and_prepare_main(main_tid, saved_regs);
-    if (tids.empty()) {
-        LOG_ERR("Failed to stop threads for rollback");
+    // Get library info for segments
+    LibraryInfo lib_info = get_library_info(lib_path);
+    if (lib_info.base_addr == 0) {
+        LOG_ERR("Failed to get library info for %s", lib_path.c_str());
         return false;
     }
 
+    std::vector<pid_t> all_tids = get_all_threads(pid_);
+    if (all_tids.empty()) {
+        LOG_ERR("No threads found");
+        return false;
+    }
+
+    std::vector<ThreadContext> contexts;
+    if (!freeze_threads_outside_library(all_tids, lib_info.segments, contexts)) {
+        LOG_ERR("Failed to freeze threads for rollback");
+        return false;
+    }
+
+    pid_t worker_tid = contexts[0].tid;
     bool success = false;
 
-    // Restore GOT if present
-    auto got_it = lib.saved_original_got.find(func_name);
-    if (got_it != lib.saved_original_got.end()) {
+    if (has_got) {
+        auto got_it = lib.saved_original_got.find(func_name);
         LOG_DBG("Restoring GOT for %s to 0x%lx", func_name.c_str(), got_it->second);
         
         uintptr_t got_entry = find_got_entry(lib.base_addr, func_name);
         if (got_entry == 0) {
             LOG_ERR("Cannot find GOT entry for %s", func_name.c_str());
-        } else if (write_remote_memory(main_tid, got_entry, &got_it->second, sizeof(got_it->second))) {
+        } else if (write_remote_memory(worker_tid, got_entry, &got_it->second, sizeof(got_it->second))) {
             LOG_INFO("Successfully rolled back GOT for %s", func_name.c_str());
             lib.saved_original_got.erase(got_it);
             success = true;
@@ -163,16 +181,15 @@ bool DL_Manager::rollback_function(const std::string& lib_path, const std::strin
         }
     }
 
-    // Restore JMP if present
-    auto jmp_it = lib.saved_original_bytes.find(func_name);
-    if (jmp_it != lib.saved_original_bytes.end()) {
+    if (has_jmp) {
+        auto jmp_it = lib.saved_original_bytes.find(func_name);
         LOG_DBG("Restoring JMP for %s (%zu bytes)", func_name.c_str(), jmp_it->second.size());
         
         uintptr_t func_addr = get_symbol_address(lib.base_addr, func_name);
         if (func_addr == 0) {
             LOG_ERR("Cannot find function %s", func_name.c_str());
         } else if (jmp_it->second.size() == 5 &&
-                   write_remote_memory(main_tid, func_addr, jmp_it->second.data(), 5)) {
+                   write_remote_memory(worker_tid, func_addr, jmp_it->second.data(), 5)) {
             LOG_INFO("Successfully rolled back JMP for %s", func_name.c_str());
             lib.saved_original_bytes.erase(jmp_it);
             success = true;
@@ -181,11 +198,10 @@ bool DL_Manager::rollback_function(const std::string& lib_path, const std::strin
         }
     }
 
-    resume_all_threads(tids);
+    restore_and_detach_all(contexts);
     
     if (success) {
         LOG_INFO("Successfully rolled back function %s", func_name.c_str());
-        // Note: Library status doesn't change when rolling back a single function
     } else {
         LOG_ERR("Failed to rollback function %s", func_name.c_str());
     }

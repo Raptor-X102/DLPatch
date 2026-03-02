@@ -72,12 +72,6 @@ static void restore_and_detach_all(const std::vector<ThreadContext>& contexts) {
     }
 }
 
-void resume_all_threads(const std::vector<pid_t>& tids) {
-    for (pid_t tid : tids) {
-        ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
-    }
-}
-
 static long ptrace_read(pid_t tid, uintptr_t addr) {
     errno = 0;
     long data = ptrace(PTRACE_PEEKDATA, tid, addr, nullptr);
@@ -237,55 +231,6 @@ bool DL_Manager::prepare_thread_for_injection(pid_t tid, struct user_regs_struct
             (unsigned long long)Arch::get_sp(prepared_regs));
     
     return true;
-}
-
-std::vector<pid_t> DL_Manager::stop_threads_and_prepare_main(pid_t& main_tid, 
-                                                              struct user_regs_struct& saved_regs) {
-    std::vector<pid_t> tids = get_all_threads(pid_);
-    if (tids.empty()) {
-        LOG_ERR("No threads found - process may have terminated");
-        return {};
-    }
-    
-    std::vector<ThreadContext> contexts;
-    if (!stop_all_threads(tids, contexts)) {
-        LOG_ERR("Failed to stop all threads");
-        return {};
-    }
-    
-    // Find main thread and save its original registers
-    main_tid = pid_;
-    bool found = false;
-    for (const auto& ctx : contexts) {
-        if (ctx.tid == main_tid) {
-            saved_regs = ctx.regs;
-            found = true;
-            break;
-        }
-    }
-    
-    if (!found) {
-        LOG_ERR("Main thread not found in stopped threads");
-        restore_and_detach_all(contexts);
-        return {};
-    }
-    
-    // Prepare main thread for injection 
-    struct user_regs_struct prepared_regs;
-    if (!prepare_thread_for_injection(main_tid, prepared_regs)) {
-        restore_and_detach_all(contexts);
-        return {};
-    }
-    
-    // Update saved_regs with prepared state
-    saved_regs = prepared_regs;
-    
-    // Return all stopped thread IDs
-    std::vector<pid_t> stopped_tids;
-    for (const auto& ctx : contexts) {
-        stopped_tids.push_back(ctx.tid);
-    }
-    return stopped_tids;
 }
 
 bool DL_Manager::wait_for_threads_to_leave_library(const std::vector<pid_t>& all_tids,
