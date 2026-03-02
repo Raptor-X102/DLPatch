@@ -9,8 +9,7 @@
  * @return true if all patches were successfully reverted
  * 
  * Restores original GOT entries and JMP patches from saved backups.
- * After successful rollback, the library becomes active again and any
- * replacement library is deactivated.
+ * After successful rollback, updates function providers and recalculates active status.
  */
 bool DL_Manager::rollback_library(const std::string& lib_path) {
     std::string normalized = normalize_path(lib_path);
@@ -32,7 +31,7 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
         return true;
     }
 
-    // Get library info to obtain segments for thread safety check
+    // Get library info for segments
     LibraryInfo lib_info = get_library_info(lib_path);
     if (lib_info.base_addr == 0) {
         LOG_ERR("Failed to get library info for %s", lib_path.c_str());
@@ -53,20 +52,11 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
         return false;
     }
 
-    // Use first thread as worker (any stopped thread is fine for memory writes)
     pid_t worker_tid = contexts[0].tid;
 
     bool all_ok = true;
     int restored_count = 0;
-    std::string replacement_lib_path;
-
-    // Find the replacement library (active non-original library different from current one)
-    for (const auto& [path, l] : tracked_libraries_) {
-        if (l.is_active && !l.is_original && path != normalized) {
-            replacement_lib_path = path;
-            break;
-        }
-    }
+    std::vector<std::string> restored_functions;
 
     // Restore GOT entries
     for (auto& p : lib.saved_original_got) {
@@ -85,6 +75,7 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
             continue;
         }
         
+        restored_functions.push_back(p.first);
         restored_count++;
         LOG_DBG("Successfully restored GOT for %s", p.first.c_str());
     }
@@ -106,24 +97,36 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
             continue;
         }
         
+        restored_functions.push_back(p.first);
         restored_count++;
         LOG_DBG("Successfully restored JMP for %s", p.first.c_str());
     }
 
     if (all_ok && restored_count > 0) {
-        lib.saved_original_got.clear();
-        lib.saved_original_bytes.clear();
-        lib.is_active = true;
-        
-        if (!replacement_lib_path.empty()) {
-            auto replacement_it = tracked_libraries_.find(replacement_lib_path);
-            if (replacement_it != tracked_libraries_.end()) {
-                replacement_it->second.is_active = false;
-                LOG_DBG("Replacement library deactivated: %s", replacement_lib_path.c_str());
-            }
+        // Remove all restored functions from function providers map
+        for (const auto& func_name : restored_functions) {
+            function_providers_.erase(func_name);
+            LOG_DBG("Function %s removed from providers map", func_name.c_str());
         }
         
-        LOG_INFO("Successfully rolled back %d patches for %s", restored_count, lib.path.c_str());
+        // Remove patch references from target libraries
+        for (const auto& target_path : lib.patched_libraries) {
+            auto target_it = tracked_libraries_.find(target_path);
+            if (target_it != tracked_libraries_.end()) {
+                auto& bwd = target_it->second.patched_by;
+                bwd.erase(std::remove(bwd.begin(), bwd.end(), normalized), bwd.end());
+            }
+        }
+        lib.patched_libraries.clear();
+        
+        // Clear patched functions
+        lib.patched_functions.clear();
+        
+        // Recalculate active status for all libraries
+        update_active_status();
+        
+        LOG_INFO("Successfully rolled back %d patches for %s (backups preserved for future use)", 
+                 restored_count, lib.path.c_str());
     } else if (restored_count == 0) {
         LOG_WARN("No patches were restored for %s", lib.path.c_str());
     } else {
@@ -141,8 +144,8 @@ bool DL_Manager::rollback_library(const std::string& lib_path) {
  * @param func_name Name of function to rollback
  * @return true if patch was successfully reverted
  * 
- * Restores either GOT entry or JMP patch for the specified function,
- * depending on which type of patch was originally applied.
+ * Restores either GOT entry or JMP patch for the specified function.
+ * After successful rollback, updates function providers and recalculates active status.
  */
 bool DL_Manager::rollback_function(const std::string& lib_path, const std::string& func_name) {
     std::string normalized = normalize_path(lib_path);
@@ -196,6 +199,13 @@ bool DL_Manager::rollback_function(const std::string& lib_path, const std::strin
         } else if (write_remote_memory(worker_tid, got_entry, &got_it->second, sizeof(got_it->second))) {
             LOG_INFO("Successfully rolled back GOT for %s", func_name.c_str());
             lib.saved_original_got.erase(got_it);
+            
+            // Remove from patched_functions if present
+            auto pf_it = std::find(lib.patched_functions.begin(), lib.patched_functions.end(), func_name);
+            if (pf_it != lib.patched_functions.end()) {
+                lib.patched_functions.erase(pf_it);
+            }
+            
             success = true;
         } else {
             LOG_ERR("Failed to write GOT for %s", func_name.c_str());
@@ -212,20 +222,36 @@ bool DL_Manager::rollback_function(const std::string& lib_path, const std::strin
         } else if (jmp_it->second.size() == 5 &&
                    write_remote_memory(worker_tid, func_addr, jmp_it->second.data(), 5)) {
             LOG_INFO("Successfully rolled back JMP for %s", func_name.c_str());
+
             lib.saved_original_bytes.erase(jmp_it);
+            
+            // Remove from patched_functions if present
+            auto pf_it = std::find(lib.patched_functions.begin(), lib.patched_functions.end(), func_name);
+            if (pf_it != lib.patched_functions.end()) {
+                lib.patched_functions.erase(pf_it);
+            }
+            
             success = true;
         } else {
             LOG_ERR("Failed to write JMP for %s", func_name.c_str());
         }
     }
 
-    restore_and_detach_all(contexts);
-    
     if (success) {
+        // Remove this function from function providers map
+        // The function now goes back to its original provider (the library itself)
+        function_providers_.erase(func_name);
+        LOG_DBG("Function %s removed from providers map, now provided by original library", 
+                func_name.c_str());
+        
+        // Recalculate active status for all libraries
+        update_active_status();
+        
         LOG_INFO("Successfully rolled back function %s", func_name.c_str());
     } else {
         LOG_ERR("Failed to rollback function %s", func_name.c_str());
     }
-    
+
+    restore_and_detach_all(contexts);
     return success;
 }

@@ -5,22 +5,64 @@
 
 /**
  * @brief Record that a new library patches the target library
- * @param normalized_new Normalized path of new library
- * @param target_path Path of target library being patched
+ * @param normalized_new Normalized path of new library (must be key in tracker)
+ * @param normalized_target Normalized path of target library (must be key in tracker)
  * 
- * Updates the patched_libraries list for the new library to track
- * which original libraries it replaces. Used for cleanup and rollback.
+ * Updates both forward (new -> target) and backward (target -> new) references
+ * to track dependencies between libraries. This prevents unloading libraries
+ * that are still being referenced by active patches.
  */
-void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& target_path) {
+void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& normalized_target) {
     auto new_lib_it = tracked_libraries_.find(normalized_new);
-    if (new_lib_it != tracked_libraries_.end()) {
-        // Add target to patched_libraries list if not already there
+    auto target_it = tracked_libraries_.find(normalized_target);
+    
+    LOG_DBG("record_patched_library: new='%s' (found=%d), target='%s' (found=%d)",
+            normalized_new.c_str(), new_lib_it != tracked_libraries_.end(),
+            normalized_target.c_str(), target_it != tracked_libraries_.end());
+    
+    if (new_lib_it != tracked_libraries_.end() && target_it != tracked_libraries_.end()) {
+        // Add forward reference: new library patches target
         if (std::find(new_lib_it->second.patched_libraries.begin(), 
                      new_lib_it->second.patched_libraries.end(), 
-                     target_path) == new_lib_it->second.patched_libraries.end()) {
-            new_lib_it->second.patched_libraries.push_back(target_path);
-            LOG_DBG("Recorded patched library %s for %s", target_path.c_str(), normalized_new.c_str());
+                     normalized_target) == new_lib_it->second.patched_libraries.end()) {
+            new_lib_it->second.patched_libraries.push_back(normalized_target);
+            LOG_DBG("Recorded forward patch: %s -> %s", 
+                    normalized_new.c_str(), normalized_target.c_str());
         }
+        
+        // Add backward reference: target is patched by new library
+        if (std::find(target_it->second.patched_by.begin(),
+                     target_it->second.patched_by.end(),
+                     normalized_new) == target_it->second.patched_by.end()) {
+            target_it->second.patched_by.push_back(normalized_new);
+            LOG_DBG("Recorded backward patch: %s <- %s", 
+                    normalized_target.c_str(), normalized_new.c_str());
+        }
+    } else {
+        LOG_ERR("CRITICAL: Failed to record patch relation: %s -> %s",
+                normalized_new.c_str(), normalized_target.c_str());
+    }
+}
+
+/**
+ * @brief Remove patch records when rolling back
+ * @param normalized_lib Library being rolled back
+ * @param target_path Target library that was patched
+ */
+void DL_Manager::remove_patch_records(const std::string& normalized_lib, const std::string& target_path) {
+    auto lib_it = tracked_libraries_.find(normalized_lib);
+    auto target_it = tracked_libraries_.find(target_path);
+    
+    if (lib_it != tracked_libraries_.end()) {
+        // Remove forward reference
+        auto& fwd = lib_it->second.patched_libraries;
+        fwd.erase(std::remove(fwd.begin(), fwd.end(), target_path), fwd.end());
+    }
+    
+    if (target_it != tracked_libraries_.end()) {
+        // Remove backward reference
+        auto& bwd = target_it->second.patched_by;
+        bwd.erase(std::remove(bwd.begin(), bwd.end(), normalized_lib), bwd.end());
     }
 }
 
@@ -38,24 +80,61 @@ bool DL_Manager::is_library_active(const std::string& lib_path) const {
 }
 
 /**
- * @brief Update active status when switching from original to new library
- * @param original_path Path of original library (becomes inactive)
- * @param new_path Path of new library (becomes active)
+ * @brief Update active status of all libraries based on current function providers
+ * 
+ * A library is active if:
+ * 1. It provides at least one function in function_providers_ map, OR
+ * 2. It's an original library that doesn't have any of its functions replaced
+ * 
+ * This ensures that libraries that provide currently used functions are marked active,
+ * and libraries that no longer provide any functions become inactive.
  */
-void DL_Manager::update_active_status(const std::string& original_path, const std::string& new_path) {
-    // Deactivate original library
-    auto orig_it = tracked_libraries_.find(original_path);
-    if (orig_it != tracked_libraries_.end()) {
-        orig_it->second.is_active = false;
-        LOG_DBG("Original library deactivated: %s", original_path.c_str());
+void DL_Manager::update_active_status() {
+    LOG_DBG("Updating active status based on function providers");
+    
+    // First, set all libraries to inactive
+    for (auto& [path, lib] : tracked_libraries_) {
+        lib.is_active = false;
     }
     
-    // Activate new library
-    auto new_it = tracked_libraries_.find(new_path);
-    if (new_it != tracked_libraries_.end()) {
-        new_it->second.is_active = true;
-        LOG_DBG("New library activated: %s", new_path.c_str());
+    // For each function in function_providers_, activate its provider library
+    for (const auto& [func_name, lib_path] : function_providers_) {
+        auto it = tracked_libraries_.find(lib_path);
+        if (it != tracked_libraries_.end()) {
+            it->second.is_active = true;
+            LOG_DBG("  Library %s is active (provides %s)", lib_path.c_str(), func_name.c_str());
+        } else {
+            LOG_WARN("  Provider library %s for function %s not found in tracker", 
+                     lib_path.c_str(), func_name.c_str());
+        }
     }
+    
+    // Also activate original libraries that don't have any of their functions replaced
+    for (auto& [path, lib] : tracked_libraries_) {
+        if (lib.is_original && !lib.is_active) {
+            // Check if any of this library's functions are provided by someone else
+            bool has_replaced_functions = false;
+            for (const auto& func : lib.provided_functions) {
+                if (function_providers_.find(func) != function_providers_.end()) {
+                    has_replaced_functions = true;
+                    break;
+                }
+            }
+            
+            // If none of its functions are replaced, this library is still active
+            if (!has_replaced_functions) {
+                lib.is_active = true;
+                LOG_DBG("  Original library %s is active (no replaced functions)", path.c_str());
+            }
+        }
+    }
+    
+    // Count active libraries for logging
+    int active_count = 0;
+    for (const auto& [path, lib] : tracked_libraries_) {
+        if (lib.is_active) active_count++;
+    }
+    LOG_DBG("Active libraries: %d out of %zu", active_count, tracked_libraries_.size());
 }
 
 /**

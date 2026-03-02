@@ -211,7 +211,7 @@ bool DL_Manager::check_target_safety(const std::string& normalized_target,
  * 1. Validates target library exists in process memory
  * 2. Checks if replacement is safe (threads not using the library)
  * 3. Freezes all threads outside the target library
- * 4. Loads the new library via remote code injection
+ * 4. Loads the new library via remote code injection (if not already loaded)
  * 5. Applies patches (JMP or GOT) to redirect functions from old to new library
  * 6. Updates tracker state and saves state to disk
  * 7. Starts cleanup daemon if needed
@@ -243,8 +243,7 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     time_t target_mtime = 0, new_mtime = 0;
     size_t target_size = 0, new_size = 0;
     bool target_info_ok = get_file_info(clean_target_path, target_mtime, target_size);
-
-    // Get new file info - for logging and state checking
+    
 #ifdef DEBUG
     bool new_info_ok = get_file_info(new_lib_path, new_mtime, new_size);
     LOG_DBG("Target file: path=%s, ok=%d, mtime=%ld, size=%zu", 
@@ -252,8 +251,6 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     LOG_DBG("New file: path=%s, ok=%d, mtime=%ld, size=%zu", 
             new_lib_path.c_str(), new_info_ok, new_mtime, new_size);
 #else
-    // In release builds, we still need the file info for check_library_state
-    // but we don't need to store the return value separately
     get_file_info(new_lib_path, new_mtime, new_size);
 #endif
 
@@ -267,19 +264,278 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     ensure_target_in_tracker(normalized_target, clean_target_path, target_info.base_addr,
                              target_mtime, target_size, target_info_ok);
 
+    // =======================================================================
+    // Special case: Switching back to an original library that was previously patched
+    // =======================================================================
+
+    auto target_it = tracked_libraries_.find(normalized_target);
+    auto new_it = tracked_libraries_.find(normalized_new);
+
+    // Check if we're switching to an original library that has patches
+    if (new_it != tracked_libraries_.end() && new_it->second.is_original) {
+        if (!new_it->second.saved_original_got.empty() || !new_it->second.saved_original_bytes.empty()) {
+            LOG_INFO("Target is original library with existing patches - will restore before applying new patches");
+            
+            // Get library info for thread safety
+            LibraryInfo lib_info = get_library_info(new_lib_path);
+            if (lib_info.base_addr == 0) {
+                LOG_ERR("Failed to get library info for %s", new_lib_path.c_str());
+                log_replacement_result(false);
+                return false;
+            }
+            
+            // Get all threads
+            std::vector<pid_t> all_tids = get_all_threads(pid_);
+            if (all_tids.empty()) {
+                LOG_ERR("No threads found");
+                log_replacement_result(false);
+                return false;
+            }
+            
+            // Freeze threads
+            std::vector<ThreadContext> contexts;
+            if (!freeze_threads_outside_library(all_tids, lib_info.segments, contexts)) {
+                LOG_ERR("Failed to freeze threads for restoration");
+                log_replacement_result(false);
+                return false;
+            }
+            
+            pid_t worker_tid = contexts[0].tid;
+            
+            // Restore original code - ТОЛЬКО для target_function
+            TrackedLibrary& lib = new_it->second;
+            
+            // Восстанавливаем ТОЛЬКО указанную функцию
+            if (target_function != "all") {
+                // Restore GOT entry if exists
+                if (lib.saved_original_got.find(target_function) != lib.saved_original_got.end()) {
+                    uintptr_t addr = lib.saved_original_got[target_function];
+                    uintptr_t got_entry = find_got_entry(lib.base_addr, target_function);
+                    if (got_entry != 0) {
+                        write_remote_memory(worker_tid, got_entry, &addr, sizeof(addr));
+                        LOG_DBG("Restored GOT for %s in original library", target_function.c_str());
+                        lib.saved_original_got.erase(target_function);
+                    }
+                }
+                
+                // Restore JMP patch if exists
+                if (lib.saved_original_bytes.find(target_function) != lib.saved_original_bytes.end()) {
+                    auto& bytes = lib.saved_original_bytes[target_function];
+                    uintptr_t func_addr = get_symbol_address(lib.base_addr, target_function);
+                    if (func_addr != 0 && bytes.size() == 5) {
+                        write_remote_memory(worker_tid, func_addr, bytes.data(), 5);
+                        LOG_DBG("Restored JMP for %s in original library", target_function.c_str());
+                        lib.saved_original_bytes.erase(target_function);
+                    }
+                }
+                
+                // Удаляем из patched_functions
+                auto pf_it = std::find(lib.patched_functions.begin(), lib.patched_functions.end(), target_function);
+                if (pf_it != lib.patched_functions.end()) {
+                    lib.patched_functions.erase(pf_it);
+                }
+            } else {
+                // Если "all" - восстанавливаем все функции
+                // Restore GOT entries
+                for (const auto& [func_name, addr] : lib.saved_original_got) {
+                    uintptr_t got_entry = find_got_entry(lib.base_addr, func_name);
+                    if (got_entry != 0) {
+                        write_remote_memory(worker_tid, got_entry, &addr, sizeof(addr));
+                        LOG_DBG("Restored GOT for %s in original library", func_name.c_str());
+                    }
+                }
+                
+                // Restore JMP patches
+                for (const auto& [func_name, bytes] : lib.saved_original_bytes) {
+                    uintptr_t func_addr = get_symbol_address(lib.base_addr, func_name);
+                    if (func_addr != 0 && bytes.size() == 5) {
+                        write_remote_memory(worker_tid, func_addr, bytes.data(), 5);
+                        LOG_DBG("Restored JMP for %s in original library", func_name.c_str());
+                    }
+                }
+                
+                lib.patched_functions.clear();
+            }
+            
+            // Save the current state (which is now original) as new backups for future rollbacks
+            // Это нужно только для функции, которую мы сейчас патентуем
+            if (target_function != "all") {
+                uintptr_t func_addr = get_symbol_address(lib.base_addr, target_function);
+                if (func_addr != 0) {
+                    uint8_t bytes[5];
+                    if (read_remote_memory(pid_, func_addr, bytes, 5)) {
+                        lib.saved_original_bytes[target_function] = 
+                            std::vector<uint8_t>(bytes, bytes + 5);
+                        LOG_DBG("Saved current bytes for %s as new backup", target_function.c_str());
+                    }
+                }
+                
+                uintptr_t got_entry = find_got_entry(lib.base_addr, target_function);
+                if (got_entry != 0) {
+                    uintptr_t got_val;
+                    if (read_remote_memory(pid_, got_entry, &got_val, sizeof(got_val))) {
+                        lib.saved_original_got[target_function] = got_val;
+                        LOG_DBG("Saved current GOT for %s as new backup", target_function.c_str());
+                    }
+                }
+            }
+            
+            // Remove patch references from target libraries - ТОЛЬКО для target_function
+            if (target_function != "all") {
+                for (const auto& target_path : lib.patched_libraries) {
+                    auto target_lib_it = tracked_libraries_.find(target_path);
+                    if (target_lib_it != tracked_libraries_.end()) {
+                        auto& bwd = target_lib_it->second.patched_by;
+                        bwd.erase(std::remove(bwd.begin(), bwd.end(), normalized_new), bwd.end());
+                    }
+                }
+                // Не очищаем весь patched_libraries, только удаляем связи для этой функции
+                // Но в текущей архитектуре patched_libraries относится ко всей библиотеке,
+                // поэтому лучше оставить как есть или переработать архитектуру
+            } else {
+                for (const auto& target_path : lib.patched_libraries) {
+                    auto target_lib_it = tracked_libraries_.find(target_path);
+                    if (target_lib_it != tracked_libraries_.end()) {
+                        auto& bwd = target_lib_it->second.patched_by;
+                        bwd.erase(std::remove(bwd.begin(), bwd.end(), normalized_new), bwd.end());
+                    }
+                }
+                lib.patched_libraries.clear();
+            }
+            
+            restore_and_detach_all(contexts);
+            LOG_INFO("Original library restored for function %s", target_function.c_str());
+        }
+    }
+
+    // =======================================================================
+    // Check library state
+    // =======================================================================
+    
     uintptr_t new_lib_base = 0, new_handle = 0;
-    LoadResult state = check_library_state(new_lib_path, new_lib_base, new_handle, true);
-
-    if (state == LoadResult::ALREADY_ACTIVE) {
-        LOG_INFO("New library already active and unchanged - nothing to do");
-        log_replacement_result(true);
-        return true;
+    LoadResult state = check_library_state(new_lib_path, new_lib_base, new_handle, false);
+    
+    bool need_load = true;
+    bool need_patch = true;
+    
+    switch (state) {
+        case LoadResult::ALREADY_ACTIVE:
+            LOG_INFO("New library already active and unchanged - applying patches to existing copy");
+            need_load = false;
+            need_patch = true;
+            break;
+            
+        case LoadResult::CHANGED:
+            LOG_INFO("New library file changed - will reload");
+            need_load = true;
+            need_patch = true;
+            break;
+            
+        case LoadResult::NOT_FOUND:
+            LOG_INFO("New library not found in tracker or maps - will load fresh");
+            need_load = true;
+            need_patch = true;
+            break;
+            
+        case LoadResult::USED_EXISTING:
+            LOG_INFO("Using existing library copy (inactive)");
+            need_load = false;
+            need_patch = true;
+            break;
+            
+        case LoadResult::LOADED_NEW:
+            LOG_WARN("Unexpected LOADED_NEW state from check_library_state");
+            need_load = false;
+            need_patch = true;
+            break;
+            
+        case LoadResult::FAILED:
+            LOG_ERR("Failed to check library state");
+            log_replacement_result(false);
+            return false;
     }
 
-    if (state == LoadResult::CHANGED) {
-        LOG_INFO("New library file changed - will reload");
+    // =======================================================================
+    // Если новая библиотека уже существует и имеет сохранённые патчи,
+    // восстанавливаем её в исходное состояние перед использованием
+    // =======================================================================
+    if (state == LoadResult::USED_EXISTING || state == LoadResult::ALREADY_ACTIVE) {
+        auto new_it = tracked_libraries_.find(normalized_new);
+        if (new_it != tracked_libraries_.end()) {
+            TrackedLibrary& new_lib = new_it->second;
+            if (!new_lib.saved_original_got.empty() || !new_lib.saved_original_bytes.empty()) {
+                LOG_INFO("New library has existing patches - restoring to original state before use");
+                
+                // Получаем информацию о сегментах библиотеки для заморозки потоков
+                LibraryInfo lib_info = get_library_info(new_lib_path);
+                if (lib_info.base_addr == 0) {
+                    LOG_ERR("Failed to get library info for %s", new_lib_path.c_str());
+                    log_replacement_result(false);
+                    return false;
+                }
+                
+                // Замораживаем потоки вне этой библиотеки
+                std::vector<pid_t> all_tids = get_all_threads(pid_);
+                if (all_tids.empty()) {
+                    LOG_ERR("No threads found");
+                    log_replacement_result(false);
+                    return false;
+                }
+                
+                std::vector<ThreadContext> contexts;
+                if (!freeze_threads_outside_library(all_tids, lib_info.segments, contexts)) {
+                    LOG_ERR("Failed to freeze threads for restoration");
+                    log_replacement_result(false);
+                    return false;
+                }
+                
+                pid_t worker_tid = contexts[0].tid;
+                
+                // Восстанавливаем GOT-записи
+                for (const auto& [func_name, addr] : new_lib.saved_original_got) {
+                    uintptr_t got_entry = find_got_entry(new_lib.base_addr, func_name);
+                    if (got_entry != 0) {
+                        if (write_remote_memory(worker_tid, got_entry, &addr, sizeof(addr))) {
+                            LOG_DBG("Restored GOT for %s", func_name.c_str());
+                        } else {
+                            LOG_ERR("Failed to restore GOT for %s", func_name.c_str());
+                        }
+                    }
+                }
+                
+                // Восстанавливаем JMP-патчи
+                for (const auto& [func_name, bytes] : new_lib.saved_original_bytes) {
+                    uintptr_t func_addr = get_symbol_address(new_lib.base_addr, func_name);
+                    if (func_addr != 0 && bytes.size() == 5) {
+                        if (write_remote_memory(worker_tid, func_addr, bytes.data(), 5)) {
+                            LOG_DBG("Restored JMP for %s", func_name.c_str());
+                            // Сбрасываем кэш инструкций
+                        } else {
+                            LOG_ERR("Failed to restore JMP for %s", func_name.c_str());
+                        }
+                    }
+                }
+                
+                // Очищаем списки заплаченных функций и зависимостей
+                new_lib.patched_functions.clear();
+                new_lib.patched_libraries.clear();
+                
+                // Удаляем ссылки на эту библиотеку из других (patched_by)
+                for (auto& [path, lib] : tracked_libraries_) {
+                    auto& bwd = lib.patched_by;
+                    bwd.erase(std::remove(bwd.begin(), bwd.end(), normalized_new), bwd.end());
+                }
+                
+                restore_and_detach_all(contexts);
+                LOG_INFO("New library restored to clean state");
+            }
+        }
     }
 
+    // =======================================================================
+    // Now we actually need to do real work - freeze threads and inject
+    // =======================================================================
+    
     // Get all threads
     std::vector<pid_t> all_tids = get_all_threads(pid_);
     if (all_tids.empty()) {
@@ -321,39 +577,46 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         return false;
     }
 
-    // Now actually load the library with real thread
-    LoadResult load_result = ensure_new_library_loaded(worker_tid, normalized_new, 
-                                                        new_lib_base, new_handle, saved_regs);
-    
-    if (load_result == LoadResult::FAILED) {
-        LOG_ERR("Failed to load new library");
-        restore_and_detach_all(contexts);
-        log_replacement_result(false);
-        return false;
+    // Load the library if needed
+    if (need_load) {
+        LoadResult load_result = ensure_new_library_loaded(worker_tid, normalized_new, 
+                                                            new_lib_base, new_handle, saved_regs);
+        
+        if (load_result == LoadResult::FAILED) {
+            LOG_ERR("Failed to load new library");
+            restore_and_detach_all(contexts);
+            log_replacement_result(false);
+            return false;
+        }
     }
     
     bool patch_success = true;
     
     // Apply patches if we have a library to patch to
-    if (load_result == LoadResult::LOADED_NEW || load_result == LoadResult::USED_EXISTING) {
+    if (need_patch && new_lib_base != 0) {
         LOG_INFO("Applying patches to %s", 
-                 load_result == LoadResult::LOADED_NEW ? "newly loaded library" : "existing library");
+                 need_load ? "newly loaded library" : "existing library");
         
         patch_success = apply_all_patches(worker_tid, normalized_target, 
                                            target_info.base_addr, new_lib_base,
                                            normalized_new, target_function);
         
         if (patch_success) {
-            // Update tracker state - only new library is active now, original becomes inactive
-            update_active_status(normalized_target, normalized_new);
-            record_patched_library(normalized_new, target_info.path);
+            // Update active status based on function providers
+            update_active_status();
             
-            // Clean up old libraries
+            // Record the patch relationship (for backward compatibility and cleanup)
+            record_patched_library(normalized_new, normalized_target);
+            
+            // Clean up old libraries (only those with no references)
             cleanup_old_libraries(normalized_target, normalized_new, worker_tid, saved_regs);
             
             // Start daemon if needed
             ensure_daemon_running();
         }
+    } else if (!need_patch) {
+        LOG_INFO("No patching needed");
+        patch_success = true;
     }
 
     // Restore registers and detach all threads

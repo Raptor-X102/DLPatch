@@ -53,6 +53,7 @@ inline void set_syscall_ret(user_regs_struct& regs, uintptr_t val) { regs.rax = 
 constexpr long SYS_MMAP = 9;
 constexpr long SYS_MUNMAP = 11;
 constexpr long SYS_GETPID = 39;
+constexpr long SYS_MPROTECT = 10;
 constexpr int R_JUMP_SLOT = 7;  // R_X86_64_JUMP_SLOT relocation type
 
 //=============================================================================

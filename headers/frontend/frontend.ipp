@@ -169,6 +169,13 @@ bool Frontend::save_state() const {
         item["saved_original_bytes"] = bytes;
 
         j["tracked_libraries"].push_back(item);
+
+        // Save function providers
+        json providers;
+        for (const auto& [func, lib] : mgr_.get_function_providers()) {
+            providers[func] = lib;
+        }
+        j["function_providers"] = providers;
     }
 
     f << j.dump(4);
@@ -251,6 +258,14 @@ bool Frontend::load_state() {
                     loaded_libs[normalized] = lib;
                     LOG_DBG("    Added normalized alias: %s", normalized.c_str());
                 }
+            }
+
+            // Load function providers
+            if (j.contains("function_providers")) {
+                for (auto& [func, lib] : j["function_providers"].items()) {
+                    mgr_.set_function_provider(func, lib);
+                }
+                LOG_DBG("Loaded %zu function providers", j["function_providers"].size());
             }
         }
         

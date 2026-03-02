@@ -17,6 +17,7 @@
  *         - ALREADY_ACTIVE: Library already active and unchanged
  *         - FAILED: Error occurred
  */
+
 LoadResult DL_Manager::check_library_state(const std::string& lib_path,
                                             uintptr_t& base, 
                                             uintptr_t& handle,
@@ -25,7 +26,7 @@ LoadResult DL_Manager::check_library_state(const std::string& lib_path,
     
     LOG_DBG("check_library_state: %s", lib_path.c_str());
     
-    // Get current file info from disk
+    // Get current file info
     time_t current_mtime = 0;
     size_t current_size = 0;
     bool file_info_ok = get_file_info(lib_path, current_mtime, current_size);
@@ -49,7 +50,15 @@ LoadResult DL_Manager::check_library_state(const std::string& lib_path,
     LOG_DBG("  in tracker: base=0x%lx, handle=0x%lx, active=%d, mtime=%ld, size=%zu",
             lib.base_addr, lib.handle, lib.is_active, lib.mtime, lib.file_size);
     
-    // Check if file has changed on disk
+    // Special case: original library that was previously patched and needs restoration
+    if (lib.is_original && (!lib.saved_original_got.empty() || !lib.saved_original_bytes.empty())) {
+        LOG_DBG("  original library with existing patches - needs restoration");
+        base = lib.base_addr;
+        handle = lib.handle;
+        return LoadResult::CHANGED;  // Signal that we need to restore
+    }
+    
+    // Check if file changed
     bool file_changed = false;
     if (file_info_ok && lib.file_size != 0) {
         if (lib.file_size != current_size) {

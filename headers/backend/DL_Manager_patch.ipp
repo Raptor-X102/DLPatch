@@ -19,7 +19,7 @@
  */
 bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uintptr_t old_func,
                               uintptr_t new_func, size_t old_func_size,
-                  const std::string& func_name) {
+                              const std::string& func_name) {
     std::string clean_path = trim(target_lib_path);
     auto lib_it = tracked_libraries_.find(clean_path);
     if (lib_it == tracked_libraries_.end()) {
@@ -42,13 +42,18 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
             return false;
         }
         
-        // Save original GOT value for rollback
-        uintptr_t orig = 0;
-        if (!read_remote_memory(pid_, got_entry, &orig, sizeof(orig))) {
-            LOG_ERR("Cannot read original GOT");
-            return false;
+        // Save original GOT value ONLY if not already saved
+        if (target_lib.saved_original_got.find(func_name) == target_lib.saved_original_got.end()) {
+            uintptr_t orig = 0;
+            if (!read_remote_memory(pid_, got_entry, &orig, sizeof(orig))) {
+                LOG_ERR("Cannot read original GOT");
+                return false;
+            }
+            target_lib.saved_original_got[func_name] = orig;
+            LOG_DBG("Saved original GOT for %s: 0x%lx", func_name.c_str(), orig);
+        } else {
+            LOG_DBG("Original GOT for %s already saved, reusing", func_name.c_str());
         }
-        target_lib.saved_original_got[func_name] = orig;
 
         // Write new function address to GOT
         if (!write_remote_memory(tid, got_entry, &new_func, sizeof(new_func))) {
@@ -56,7 +61,8 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
             return false;
         }
         
-        LOG_DBG("GOT patched %s: 0x%lx -> 0x%lx", func_name.c_str(), orig, new_func);
+        LOG_DBG("GOT patched %s: 0x%lx -> 0x%lx", func_name.c_str(), 
+                target_lib.saved_original_got[func_name], new_func);
         return true;
     }
 
@@ -67,14 +73,19 @@ bool DL_Manager::apply_patch(pid_t tid, const std::string& target_lib_path, uint
         return false;
     }
 
-    // Save original bytes for rollback
-    uint8_t orig_bytes[5];
-    if (!read_remote_memory(pid_, old_func, orig_bytes, 5)) {
-        LOG_ERR("Cannot read original bytes for %s", func_name.c_str());
-        return false;
+    // Save original bytes ONLY if not already saved
+    if (target_lib.saved_original_bytes.find(func_name) == target_lib.saved_original_bytes.end()) {
+        uint8_t orig_bytes[5];
+        if (!read_remote_memory(pid_, old_func, orig_bytes, 5)) {
+            LOG_ERR("Cannot read original bytes for %s", func_name.c_str());
+            return false;
+        }
+        target_lib.saved_original_bytes[func_name] = 
+            std::vector<uint8_t>(orig_bytes, orig_bytes + 5);
+        LOG_DBG("Saved original bytes for %s", func_name.c_str());
+    } else {
+        LOG_DBG("Original bytes for %s already saved, reusing", func_name.c_str());
     }
-    target_lib.saved_original_bytes[func_name] = 
-        std::vector<uint8_t>(orig_bytes, orig_bytes + 5);
     
     // Create and write JMP patch
     auto patch = Arch::create_jmp_patch(old_func, new_func);
@@ -148,6 +159,11 @@ bool DL_Manager::apply_all_patches(pid_t tid,
                 
                 if (apply_patch(tid, target_lib_path, old_func_addr, new_func_addr, sym.size, func_name)) {
                     patched_functions.push_back(func_name);
+                    
+                    // Update function providers map - this function is now provided by new_lib_path
+                    function_providers_[func_name] = new_lib_path;
+                    LOG_DBG("Function %s now provided by %s", func_name.c_str(), new_lib_path.c_str());
+                    
                     succeeded++;
                     any_success = true;
                 } else {
@@ -199,6 +215,10 @@ bool DL_Manager::apply_all_patches(pid_t tid,
             any_success = apply_patch(tid, target_lib_path, old_func, new_func, old_size, target_function);
             if (any_success) {
                 tracked_libraries_[new_lib_path].provided_functions.push_back(target_function);
+                
+                // Update function providers map - this function is now provided by new_lib_path
+                function_providers_[target_function] = new_lib_path;
+                LOG_DBG("Function %s now provided by %s", target_function.c_str(), new_lib_path.c_str());
             }
         } else {
             LOG_INFO("Function addresses are identical, no patch needed.");
@@ -220,16 +240,18 @@ bool DL_Manager::apply_all_patches(pid_t tid,
  * - Not the new library
  * - Not original libraries
  * - Inactive (not currently patched to)
- * This prevents memory leaks from accumulating replacement libraries.
+ * - Not referenced by any other library (patched_by empty)
+ * This prevents memory leaks and dangling pointers from accumulating.
  */
+
 void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
                                         const std::string& new_lib_path,
                                         pid_t tid,
                                         struct user_regs_struct& saved_regs) {
     LOG_DBG("Cleaning up old libraries...");
     
-    std::string normalized_target = target_lib_path;
-    std::string normalized_new = new_lib_path;
+    std::string normalized_target = normalize_path(target_lib_path);
+    std::string normalized_new = normalize_path(new_lib_path);
     
     std::set<std::string> to_unload;
     for (const auto& pair : tracked_libraries_) {
@@ -241,10 +263,22 @@ void DL_Manager::cleanup_old_libraries(const std::string& target_lib_path,
         // Skip original libraries (can't unload them)
         if (lib.is_original) continue;
         
-        // Skip if still active (shouldn't happen, but just in case)
+        // Skip if still active
         if (lib.is_active) continue;
         
-        // This is an inactive non-original library - can unload
+        // Check if any other library still points to this one
+        if (!lib.patched_by.empty()) {
+#ifdef DEBUG
+            LOG_DBG("Library %s still referenced by %zu libraries, cannot unload:",
+                    lib.path.c_str(), lib.patched_by.size());
+            for (const auto& ref : lib.patched_by) {
+                LOG_DBG("  - referenced by: %s", ref.c_str());
+            }
+#endif
+            continue;
+        }
+        
+        // This is an inactive non-original library with no references - can unload
         to_unload.insert(pair.first);
     }
     

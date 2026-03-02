@@ -243,6 +243,10 @@ bool DL_Manager::unload_library_by_handle(pid_t tid, uintptr_t handle,
  * @return true if unload succeeded, false otherwise
  * 
  * Only non-original, inactive libraries can be unloaded.
+ * A library is considered inactive if:
+ * 1. It is not marked as original
+ * 2. It does not provide any functions in function_providers_ map
+ * 3. It is not referenced by any other library (patched_by empty)
  */
 bool DL_Manager::unload_library(const std::string& lib_path) {
     std::string normalized = normalize_path(lib_path);
@@ -255,12 +259,34 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     
     TrackedLibrary& lib = it->second;
     
-    if (lib.is_active) {
-        LOG_ERR("Cannot unload active library");
+    // Check if library is original
+    if (lib.is_original) {
+        LOG_ERR("Cannot unload original library: %s", lib_path.c_str());
         return false;
     }
-    if (lib.is_original) {
-        LOG_ERR("Cannot unload original library");
+    
+    // Check if library provides any functions
+    bool provides_functions = false;
+    for (const auto& [func_name, provider] : function_providers_) {
+        if (provider == normalized) {
+            provides_functions = true;
+            LOG_DBG("Library %s provides function %s", lib_path.c_str(), func_name.c_str());
+            break;
+        }
+    }
+    
+    if (provides_functions) {
+        LOG_ERR("Cannot unload library that provides active functions: %s", lib_path.c_str());
+        return false;
+    }
+    
+    // Check if library is referenced by others
+    if (!lib.patched_by.empty()) {
+        LOG_ERR("Cannot unload library that is still referenced by %zu other libraries: %s", 
+                lib.patched_by.size(), lib_path.c_str());
+        for (const auto& ref : lib.patched_by) {
+            LOG_DBG("  - referenced by: %s", ref.c_str());
+        }
         return false;
     }
     

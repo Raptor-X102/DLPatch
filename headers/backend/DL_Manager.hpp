@@ -82,6 +82,13 @@ public:
         return tracked_libraries_;
     }
 
+    const std::map<std::string, std::string>& get_function_providers() const {
+        return function_providers_;
+    }
+
+    void set_function_provider(const std::string& func_name, const std::string& lib_path) {
+        function_providers_[func_name] = lib_path;
+    }
     //=============================================================================
     // PUBLIC INTERFACE - Methods intended for external use
     //=============================================================================
@@ -151,6 +158,7 @@ private:
     uintptr_t dlclose_addr_;         // Address of dlclose in target
     uintptr_t syscall_insn_;         // Address of syscall instruction
     bool tracker_initialized_;       // Whether tracker has been initialized
+    std::map<std::string, std::string> function_providers_; // Maps function names to the library that currently provides them
 
     std::map<std::string, TrackedLibrary> tracked_libraries_; // Tracked libraries by path
     mutable std::map<uintptr_t, CachedLibraryData> library_cache_; // Cache by base address
@@ -236,8 +244,8 @@ private:
     bool is_library_active(const std::string &lib_path) const;
     void record_patched_library(const std::string &normalized_new,
                                 const std::string &target_path);
-    void update_active_status(const std::string &original_path,
-                              const std::string &new_path);
+    void remove_patch_records(const std::string& normalized_lib, const std::string& target_path);
+    void update_active_status();
     void update_tracked_file_info(TrackedLibrary &lib,
                                   time_t mtime,
                                   size_t size,
@@ -268,7 +276,6 @@ private:
                            uintptr_t new_base,
                            const std::string &new_lib_path,
                            const std::string &target_function);
-
     //-------------------------------------------------------------------------
     // State checking methods (DL_Manager_state.ipp)
     //-------------------------------------------------------------------------

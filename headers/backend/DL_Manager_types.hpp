@@ -77,14 +77,16 @@ struct ThreadContext {
  * @brief Complete state of a tracked library, including patch backups
  */
 struct TrackedLibrary {
-    std::string path;                            // Library path (used as key)
-    uintptr_t handle;                            // Handle returned by dlopen
-    uintptr_t base_addr;                         // Base address in memory
-    std::vector<std::string> patched_functions;  // Functions patched from other libraries
+    std::string path;                           // Library path (used as key)
+    uintptr_t handle;                           // Handle returned by dlopen
+    uintptr_t base_addr;                        // Base address in memory
+    std::vector<std::string> patched_functions; // Functions patched from other libraries
     std::vector<std::string> provided_functions; // All functions this library exports
-    std::vector<std::string> patched_libraries;  // Libraries that were patched to point to this one
-    bool is_active;                               // Whether this library is currently the target of any patch
-    bool is_original;                             // Whether this is the original library (never unloaded)
+    std::vector<std::string> patched_libraries; // Libraries that were patched to point to this one
+    std::vector<std::string> patched_by;        // Libraries that have patches pointing to this one (NEW)
+    bool is_partially_replaced = false;
+    bool is_active;                              // Whether this library is currently the target of any patch
+    bool is_original;                            // Whether this is the original library (never unloaded)
     
     // Backup data for rollback
     std::map<std::string, std::vector<uint8_t>> saved_original_bytes; // Original bytes for JMP patch rollback
@@ -94,6 +96,7 @@ struct TrackedLibrary {
     time_t mtime;     // File modification time
     size_t file_size; // File size
 
+    // Constructors
     TrackedLibrary()
         : handle(0)
         , base_addr(0)
