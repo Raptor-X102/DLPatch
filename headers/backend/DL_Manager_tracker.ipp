@@ -1,50 +1,4 @@
-// Update file info in tracker if it changed on disk (with tolerance for mtime)
-static void update_tracked_file_info(TrackedLibrary& lib, time_t mtime, size_t size, bool info_ok) {
-    if (!info_ok) {
-        LOG_DBG("update_tracked_file_info: no valid info, skipping");
-        return;
-    }
-    
-    LOG_DBG("update_tracked_file_info: lib.mtime=%ld, lib.size=%zu, new.mtime=%ld, new.size=%zu",
-            lib.mtime, lib.file_size, mtime, size);
-    
-    // If we don't have valid info in tracker yet, just store it
-    if (lib.file_size == 0 && lib.mtime == 0) {
-        LOG_DBG("First time getting valid file info for tracked library - storing");
-        lib.mtime = mtime;
-        lib.file_size = size;
-        return;
-    }
-    
-    // Normal case - compare with existing
-    bool changed = false;
-    
-    // Size change is definitive
-    if (lib.file_size != size) {
-        LOG_DBG("Size changed: %zu -> %zu", lib.file_size, size);
-        changed = true;
-    }
-    // For mtime, only consider significant changes (> tolerance)
-    else if (lib.mtime != mtime) {
-        time_t diff = llabs(lib.mtime - mtime);
-        if (diff > MTIME_TOLERANCE) {
-            LOG_DBG("mtime changed significantly: %ld -> %ld (diff=%ld > %ld)", 
-                    lib.mtime, mtime, diff, MTIME_TOLERANCE);
-            changed = true;
-        } else {
-            LOG_DBG("mtime changed insignificantly (diff=%ld <= %ld) - ignoring", 
-                    diff, MTIME_TOLERANCE);
-        }
-    }
-    
-    if (changed) {
-        LOG_WARN("Library file has changed on disk since last load");
-        lib.mtime = mtime;
-        lib.file_size = size;
-    } else {
-        LOG_DBG("File unchanged");
-    }
-}
+// DL_manager_tracker.ipp
 
 void DL_Manager::record_patched_library(const std::string& normalized_new, const std::string& target_path) {
     auto new_lib_it = tracked_libraries_.find(normalized_new);
@@ -57,13 +11,6 @@ void DL_Manager::record_patched_library(const std::string& normalized_new, const
             new_lib_it->second.patched_libraries.push_back(target_path);
             LOG_DBG("Recorded patched library %s for %s", target_path.c_str(), normalized_new.c_str());
         }
-    }
-}
-
-void DL_Manager::update_active_status(const std::string& normalized_new) {
-    // Only the new library remains active
-    for (auto& pair : tracked_libraries_) {
-        pair.second.is_active = (pair.first == normalized_new);
     }
 }
 
@@ -149,4 +96,51 @@ void DL_Manager::print_library_tracker() const {
         LOG_INFO("    Patched libs: %zu", lib.patched_libraries.size());
     }
     LOG_INFO("==============================");
+}
+
+void DL_Manager::update_tracked_file_info(TrackedLibrary& lib, time_t mtime, size_t size, bool info_ok) {
+    if (!info_ok) {
+        LOG_DBG("update_tracked_file_info: no valid info, skipping");
+        return;
+    }
+    
+    LOG_DBG("update_tracked_file_info: lib.mtime=%ld, lib.size=%zu, new.mtime=%ld, new.size=%zu",
+            lib.mtime, lib.file_size, mtime, size);
+    
+    // If we don't have valid info in tracker yet, just store it
+    if (lib.file_size == 0 && lib.mtime == 0) {
+        LOG_DBG("First time getting valid file info for tracked library - storing");
+        lib.mtime = mtime;
+        lib.file_size = size;
+        return;
+    }
+    
+    // Normal case - compare with existing
+    bool changed = false;
+    
+    // Size change is definitive
+    if (lib.file_size != size) {
+        LOG_DBG("Size changed: %zu -> %zu", lib.file_size, size);
+        changed = true;
+    }
+    // For mtime, only consider significant changes (> tolerance)
+    else if (lib.mtime != mtime) {
+        time_t diff = llabs(lib.mtime - mtime);
+        if (diff > MTIME_TOLERANCE) {
+            LOG_DBG("mtime changed significantly: %ld -> %ld (diff=%ld > %ld)", 
+                    lib.mtime, mtime, diff, MTIME_TOLERANCE);
+            changed = true;
+        } else {
+            LOG_DBG("mtime changed insignificantly (diff=%ld <= %ld) - ignoring", 
+                    diff, MTIME_TOLERANCE);
+        }
+    }
+    
+    if (changed) {
+        LOG_WARN("Library file has changed on disk since last load");
+        lib.mtime = mtime;
+        lib.file_size = size;
+    } else {
+        LOG_DBG("File unchanged");
+    }
 }

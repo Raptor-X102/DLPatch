@@ -17,4 +17,4 @@ int test_internal(int a, int b);
 }
 #endif
 
-#endif// TINY_MATH_OPS_H
+#endif // TINY_MATH_OPS_H

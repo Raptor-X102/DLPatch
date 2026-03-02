@@ -179,10 +179,6 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
     ensure_target_in_tracker(normalized_target, clean_target_path, target_info.base_addr,
                              target_mtime, target_size, target_info_ok);
 
-    // =======================================================================
-    // EARLY CHECK: Check library state WITHOUT thread
-    // =======================================================================
-    
     uintptr_t new_lib_base = 0, new_handle = 0;
     LoadResult state = check_library_state(new_lib_path, new_lib_base, new_handle, true);
 
@@ -196,10 +192,6 @@ bool DL_Manager::replace_library(const std::string& target_lib_pattern,
         LOG_INFO("New library file changed - will reload");
     }
 
-    // =======================================================================
-    // Now we actually need to do real work - freeze threads and inject
-    // =======================================================================
-    
     // Get all threads
     std::vector<pid_t> all_tids = get_all_threads(pid_);
     if (all_tids.empty()) {
