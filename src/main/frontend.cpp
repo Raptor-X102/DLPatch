@@ -39,8 +39,8 @@ static void check_ptrace_capability() {
             << "\n[NOTE] The program lacks CAP_SYS_PTRACE capability.\n"
             << "       To replace libraries in processes not started by this tool,\n"
             << "       you need to add this capability:\n"
-            << "         sudo setcap cap_sys_ptrace=eip ./build/dl_manager\n"
-            << "         sudo setcap cap_sys_ptrace=eip ./build/dl_manager_daemon\n"
+            << "         sudo setcap cap_sys_ptrace=eip ./build/dlpatch\n"
+            << "         sudo setcap cap_sys_ptrace=eip ./build/dlpatchd\n"
             << "       Or run with sudo (not recommended).\n\n";
     }
 

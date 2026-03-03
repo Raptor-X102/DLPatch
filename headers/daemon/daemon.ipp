@@ -95,7 +95,7 @@ static unsigned long long get_process_starttime(pid_t pid) {
 
 Daemon::Daemon() : running_(false), interval_(5) {
     home_dir_ = get_home_dir();
-    base_dir_ = home_dir_ + "/.dl_manager";
+    base_dir_ = home_dir_ + "/.dlpatch";
     ensure_dir(base_dir_);
     ensure_dir(get_state_dir());
 }
@@ -119,7 +119,7 @@ void Daemon::remove_pid_file() const {
 }
 
 bool Daemon::is_running() {
-    std::string pid_str = read_file(get_home_dir() + "/.dl_manager/daemon.pid");
+    std::string pid_str = read_file(get_home_dir() + "/.dlpatch/daemon.pid");
     if (pid_str.empty()) return false;
     pid_t pid = std::stoi(pid_str);
     return kill(pid, 0) == 0;
@@ -159,7 +159,7 @@ bool Daemon::start() {
 }
 
 bool Daemon::stop_daemon() {
-    std::string pid_str = read_file(get_home_dir() + "/.dl_manager/daemon.pid");
+    std::string pid_str = read_file(get_home_dir() + "/.dlpatch/daemon.pid");
     if (pid_str.empty()) return false;
     pid_t pid = std::stoi(pid_str);
     return kill(pid, SIGTERM) == 0;

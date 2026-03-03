@@ -77,10 +77,16 @@ add_executable(dlpatch src/main/frontend.cpp)
 target_compile_definitions(dlpatch PRIVATE
     $<$<CONFIG:Debug>:DEBUG>
     $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
-    HAVE_LIBCAP
 )
 
-target_link_libraries(dlpatch PRIVATE dl pthread nlohmann_json::nlohmann_json PkgConfig::LIBCAP)
+if(HAVE_LIBCAP)
+    target_compile_definitions(dlpatch PRIVATE HAVE_LIBCAP)
+endif()
+
+target_link_libraries(dlpatch PRIVATE dl pthread nlohmann_json::nlohmann_json)
+if(LIBCAP_FOUND)
+    target_link_libraries(dlpatch PRIVATE PkgConfig::LIBCAP)
+endif()
 
 #===============================================================================
 # Daemon executable: dlpatchd
@@ -91,20 +97,23 @@ add_executable(dlpatchd src/daemon/daemon.cpp)
 target_compile_definitions(dlpatchd PRIVATE
     $<$<CONFIG:Debug>:DEBUG>
     $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
-    HAVE_LIBCAP
 )
 
-target_link_libraries(dlpatchd PRIVATE dl pthread nlohmann_json::nlohmann_json PkgConfig::LIBCAP)
-
-#===============================================================================
-# Tests
-#===============================================================================
-
-option(BUILD_TESTS "Build tests" ON)
-
-if(BUILD_TESTS)
-    add_subdirectory(tests)
+if(HAVE_LIBCAP)
+    target_compile_definitions(dlpatchd PRIVATE HAVE_LIBCAP)
 endif()
+
+target_link_libraries(dlpatchd PRIVATE dl pthread nlohmann_json::nlohmann_json)
+if(LIBCAP_FOUND)
+    target_link_libraries(dlpatchd PRIVATE PkgConfig::LIBCAP)
+endif()
+
+#===============================================================================
+# Tests (DISABLED IN RELEASE)
+#===============================================================================
+
+# Tests are completely disabled in release branch
+# lib_target is also excluded
 
 #===============================================================================
 # Installation
@@ -172,7 +181,6 @@ set -e
 
 echo \"========================================\"
 echo \"Building DLPatch with ${NCPUS} cores...\"
-echo \"Tests: ON\"
 echo \"========================================\"
 
 cd \"${CMAKE_BINARY_DIR}\" && make -j${NCPUS}
@@ -205,13 +213,12 @@ add_custom_target(info
     COMMAND ${CMAKE_COMMAND} -E echo "========================================"
     COMMAND ${CMAKE_COMMAND} -E echo "  Parallel cores: ${NCPUS}"
     COMMAND ${CMAKE_COMMAND} -E echo "  Build type: ${CMAKE_BUILD_TYPE}"
-    COMMAND ${CMAKE_COMMAND} -E echo "  Tests enabled: ON"
-    COMMAND ${CMAKE_COMMAND} -E echo "  libcap: FOUND (required)"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Tests enabled: NO (release)"
+    COMMAND ${CMAKE_COMMAND} -E echo "  libcap support: YES (required)"
     COMMAND ${CMAKE_COMMAND} -E echo ""
     COMMAND ${CMAKE_COMMAND} -E echo "Commands:"
     COMMAND ${CMAKE_COMMAND} -E echo "  ./install.sh                    # Build + install + capabilities"
     COMMAND ${CMAKE_COMMAND} -E echo "  cd build && make -jN            # Build only"
-    COMMAND ${CMAKE_COMMAND} -E echo "  cd build && make test           # Run tests"
     COMMAND ${CMAKE_COMMAND} -E echo "  cd build && make install-interactive # Install + capabilities"
     COMMAND ${CMAKE_COMMAND} -E echo "  sudo make cap-installed         # Set capabilities (if missing)"
     COMMAND ${CMAKE_COMMAND} -E echo "========================================"
@@ -222,13 +229,14 @@ add_custom_target(info
 #===============================================================================
 
 message(STATUS "")
-message(STATUS "=== DLPatch ${PROJECT_VERSION} ===")
-message(STATUS "Tests enabled: ON")
+message(STATUS "=== DLPatch ${PROJECT_VERSION} RELEASE BUILD ===")
+message(STATUS "Tests: DISABLED")
+message(STATUS "lib_target: EXCLUDED")
 message(STATUS "Parallel build: ${NCPUS} cores")
-message(STATUS "libcap: FOUND - capabilities will be set automatically")
+message(STATUS "libcap: REQUIRED - capabilities will be set automatically")
 message(STATUS "")
-message(STATUS "QUICK START (RECOMMENDED):")
+message(STATUS "QUICK START:")
 message(STATUS "  ./install.sh")
 message(STATUS "")
 message(STATUS "This will: build, install, and set CAP_SYS_PTRACE")
-message(STATUS "===================================")
+message(STATUS "================================================")

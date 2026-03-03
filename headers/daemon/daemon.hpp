@@ -26,7 +26,7 @@
  * @brief Background daemon that cleans up state files of terminated processes
  * 
  * The daemon runs in the background and periodically scans the state directory
- * (~/.dl_manager/state/) for JSON files belonging to processes that no longer
+ * (~/.dlpatch/state/) for JSON files belonging to processes that no longer
  * exist. It uses process start times to ensure it doesn't delete files of
  * processes that have been replaced by new instances with the same PID.
  */
@@ -102,13 +102,13 @@ private:
     void cleanup_dead_processes();
 
     /**
-     * @brief Get the state directory path (~/.dl_manager/state/)
+     * @brief Get the state directory path (~/.dlpatch/state/)
      * @return Path to state directory
      */
     std::string get_state_dir() const;
 
     /**
-     * @brief Get the pid file path (~/.dl_manager/daemon.pid)
+     * @brief Get the pid file path (~/.dlpatch/daemon.pid)
      * @return Path to pid file
      */
     std::string get_pid_file() const;
@@ -138,7 +138,7 @@ private:
     std::atomic<bool> running_;          // Control flag for main loop
     std::chrono::seconds interval_;      // Sleep interval between scans
     std::string home_dir_;                // User's home directory
-    std::string base_dir_;                // Base directory (~/.dl_manager)
+    std::string base_dir_;                // Base directory (~/.dlpatch)
 };
 
 // Include implementation

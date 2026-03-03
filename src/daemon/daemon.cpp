@@ -13,7 +13,7 @@
  * @param argv Argument vector
  * @return 0 on success, 1 on error
  * 
- * Usage: dl_manager_daemon {start|stop|status}
+ * Usage: dlpatchd {start|stop|status}
  *   start  - Start the background daemon
  *   stop   - Stop the running daemon
  *   status - Check if daemon is running

@@ -39,7 +39,7 @@ Frontend::Frontend(pid_t pid) : pid_(pid), mgr_(pid) {
  * @brief Get the path to the state file for this PID
  * @return Full path to JSON state file
  * 
- * Creates ~/.dl_manager/state/ directory if it doesn't exist.
+ * Creates ~/.dlpatch/state/ directory if it doesn't exist.
  */
 std::string Frontend::get_state_path() const {
     const char* home = getenv("HOME");
@@ -55,7 +55,7 @@ std::string Frontend::get_state_path() const {
         home = pw ? pw->pw_dir : ".";
     }
     
-    std::string base_dir = std::string(home) + "/.dl_manager";
+    std::string base_dir = std::string(home) + "/.dlpatch";
     std::string state_dir = base_dir + "/state";
     
     // Create directories if they don't exist
@@ -296,7 +296,7 @@ bool Frontend::ensure_daemon_running() const {
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
-        execlp("dl_manager_daemon", "dl_manager_daemon", "start", nullptr);
+        execlp("dlpatchd", "dlpatchd", "start", nullptr);
         exit(1);
     }
     waitpid(pid, nullptr, 0);
