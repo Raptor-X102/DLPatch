@@ -1,0 +1,4 @@
+#pragma once
+
+#define DLPATCH_VERSION "@PROJECT_VERSION@"
+#define DLPATCH_NAME "@PROJECT_NAME@"

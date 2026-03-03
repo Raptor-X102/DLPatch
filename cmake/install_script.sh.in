@@ -1,0 +1,107 @@
+#!/bin/bash
+# Interactive installation script - ALWAYS sets CAP_SYS_PTRACE
+
+set -e
+
+BINARY_DIR="@CMAKE_BINARY_DIR@"
+SOURCE_DIR="@CMAKE_SOURCE_DIR@"
+VERSION="@PROJECT_VERSION@"
+
+echo "========================================"
+echo "  DLPatch v${VERSION} Installation"
+echo "  (CAP_SYS_PTRACE will be set automatically)"
+echo "========================================"
+echo ""
+
+# Check if executables exist
+if [ ! -f "${BINARY_DIR}/dlpatch" ] || [ ! -f "${BINARY_DIR}/dlpatchd" ]; then
+    echo "❌ Executables not found. Build first:"
+    echo "  cd ${BINARY_DIR} && make -j"
+    exit 1
+fi
+
+echo "Components to install:"
+echo "  - dlpatch (main)"
+echo "  - dlpatchd (daemon)"
+echo ""
+
+# Installation location
+read -p "Install to system directory (/usr/local)? [Y/n] " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Nn]$ ]]; then
+    read -p "Enter custom prefix: " CUSTOM_PREFIX
+    INSTALL_PREFIX="${CUSTOM_PREFIX}"
+else
+    INSTALL_PREFIX="/usr/local"
+fi
+
+# PATH integration
+echo ""
+read -p "Add to PATH (symlinks in /usr/local/bin)? [Y/n] " -n 1 -r
+echo
+CREATE_SYMLINKS=0
+if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+    CREATE_SYMLINKS=1
+fi
+
+echo ""
+echo "Installing to: ${INSTALL_PREFIX}/bin"
+echo ""
+
+# Determine sudo need
+sudo_cmd=""
+if [[ "${INSTALL_PREFIX}" == "/usr/local"* ]] || [[ "${INSTALL_PREFIX}" == "/usr"* ]]; then
+    if [ ! -w "${INSTALL_PREFIX}/bin" ] 2>/dev/null; then
+        sudo_cmd="sudo"
+        echo "⚠️  System directory - will use sudo"
+    fi
+fi
+
+# Create directories
+${sudo_cmd} mkdir -p "${INSTALL_PREFIX}/bin"
+
+# Copy executables (NO setuid!)
+echo "Copying executables..."
+${sudo_cmd} cp "${BINARY_DIR}/dlpatch" "${INSTALL_PREFIX}/bin/"
+${sudo_cmd} cp "${BINARY_DIR}/dlpatchd" "${INSTALL_PREFIX}/bin/"
+${sudo_cmd} chmod 755 "${INSTALL_PREFIX}/bin/dlpatch" "${INSTALL_PREFIX}/bin/dlpatchd"
+echo "✅ Executables installed (regular permissions)"
+
+# ALWAYS set capabilities (REQUIRED for ptrace)
+echo ""
+echo "🔧 Setting CAP_SYS_PTRACE capability (REQUIRED for ptrace)..."
+if command -v setcap >/dev/null 2>&1; then
+    sudo setcap cap_sys_ptrace=eip "${INSTALL_PREFIX}/bin/dlpatch" 2>/dev/null || echo "⚠️  Failed to set capabilities"
+    sudo setcap cap_sys_ptrace=eip "${INSTALL_PREFIX}/bin/dlpatchd" 2>/dev/null || echo "⚠️  Failed to set capabilities"
+    echo "✅ CAP_SYS_PTRACE set"
+else
+    echo "❌ setcap not found! Cannot set required capabilities."
+    echo "   Install libcap-bin and run manually:"
+    echo "   sudo setcap cap_sys_ptrace=eip ${INSTALL_PREFIX}/bin/dlpatch"
+    exit 1
+fi
+
+# Symlinks if needed
+if [ ${CREATE_SYMLINKS} -eq 1 ] && [ "${INSTALL_PREFIX}/bin" != "/usr/local/bin" ]; then
+    echo "Creating symlinks in /usr/local/bin..."
+    sudo ln -sf "${INSTALL_PREFIX}/bin/dlpatch" "/usr/local/bin/dlpatch" 2>/dev/null || true
+    sudo ln -sf "${INSTALL_PREFIX}/bin/dlpatchd" "/usr/local/bin/dlpatchd" 2>/dev/null || true
+    echo "✅ Symlinks created"
+    
+    # Also set capabilities on symlinks targets (already set above)
+fi
+
+# Create state directory in user's home
+mkdir -p "${HOME}/.dlpatch/state" 2>/dev/null || true
+
+echo ""
+echo "========================================"
+echo "✅ Installation complete!"
+echo "========================================"
+echo ""
+echo "Verification:"
+ls -l "${INSTALL_PREFIX}/bin/dlpatch" | sed 's/^/  /'
+getcap "${INSTALL_PREFIX}/bin/dlpatch" 2>/dev/null | sed 's/^/  /' || echo "  ⚠️  Capabilities not set!"
+echo ""
+echo "Try running: dlpatch --help"
+echo ""

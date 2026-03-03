@@ -1,9 +1,9 @@
 #===============================================================================
-# Root CMakeLists.txt for LivePatching project
+# Root CMakeLists.txt for DLPatch project
 #===============================================================================
 
 cmake_minimum_required(VERSION 3.10)
-project(LivePatching LANGUAGES CXX)
+project(DLPatch VERSION 1.0.0 LANGUAGES CXX)
 
 #===============================================================================
 # Project configuration
@@ -13,38 +13,37 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 
+# Detect number of CPU cores for parallel build
+include(ProcessorCount)
+ProcessorCount(NCPUS)
+if(NCPUS EQUAL 0)
+    set(NCPUS 2)
+endif()
+message(STATUS "Parallel build: ${NCPUS} cores available")
+
 #===============================================================================
-# Build type configuration - controls DEBUG/NDEBUG macros
+# Build type configuration
 #===============================================================================
 
-# Print build type information
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
-    message(STATUS "Build type not specified, defaulting to Release")
-else()
-    message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-endif()
-
-# Set DEBUG/NDEBUG macros based on build type
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_definitions(-DDEBUG)
-    message(STATUS "DEBUG macro defined - verbose logging enabled")
-else()
-    add_definitions(-DNDEBUG)
-    message(STATUS "NDEBUG macro defined - debug logging disabled")
+    message(STATUS "Build type: Release (default)")
 endif()
 
 #===============================================================================
 # External dependencies
 #===============================================================================
 
-# JSON library for communication protocol
 find_package(nlohmann_json CONFIG REQUIRED)
 
-# libcap for capability management (optional)
-find_library(LIB_CAP NAMES cap)
-if(NOT LIB_CAP)
-    message(WARNING "libcap not found. Install libcap-dev or equivalent for capability support.")
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBCAP IMPORTED_TARGET libcap)
+if(LIBCAP_FOUND)
+    set(HAVE_LIBCAP TRUE)
+    message(STATUS "libcap found - capability support available")
+else()
+    set(HAVE_LIBCAP FALSE)
+    message(FATAL_ERROR "libcap is REQUIRED for ptrace capabilities. Install libcap-dev.")
 endif()
 
 #===============================================================================
@@ -56,81 +55,180 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/headers/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/headers/daemon
     ${CMAKE_CURRENT_SOURCE_DIR}/headers/frontend
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 #===============================================================================
-# Main executable: dl_manager
+# Version header generation
 #===============================================================================
 
-add_executable(dl_manager
-    src/main/frontend.cpp
-)
-
-target_link_libraries(dl_manager PRIVATE 
-    dl 
-    pthread
-    nlohmann_json::nlohmann_json
-    ${LIB_CAP}
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/version.h"
+    @ONLY
 )
 
 #===============================================================================
-# Daemon executable: dl_manager_daemon
+# Main executable: dlpatch
 #===============================================================================
 
-add_executable(dl_manager_daemon
-    src/daemon/daemon.cpp
+add_executable(dlpatch src/main/frontend.cpp)
+
+target_compile_definitions(dlpatch PRIVATE
+    $<$<CONFIG:Debug>:DEBUG>
+    $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+    HAVE_LIBCAP
 )
 
-target_link_libraries(dl_manager_daemon PRIVATE 
-    dl 
-    pthread
-    nlohmann_json::nlohmann_json
-    ${LIB_CAP}
+target_link_libraries(dlpatch PRIVATE dl pthread nlohmann_json::nlohmann_json PkgConfig::LIBCAP)
+
+#===============================================================================
+# Daemon executable: dlpatchd
+#===============================================================================
+
+add_executable(dlpatchd src/daemon/daemon.cpp)
+
+target_compile_definitions(dlpatchd PRIVATE
+    $<$<CONFIG:Debug>:DEBUG>
+    $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+    HAVE_LIBCAP
 )
+
+target_link_libraries(dlpatchd PRIVATE dl pthread nlohmann_json::nlohmann_json PkgConfig::LIBCAP)
+
+#===============================================================================
+# Tests
+#===============================================================================
+
+option(BUILD_TESTS "Build tests" ON)
+
+if(BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
 
 #===============================================================================
 # Installation
 #===============================================================================
 
-install(TARGETS dl_manager dl_manager_daemon RUNTIME DESTINATION bin)
+install(TARGETS dlpatch dlpatchd RUNTIME DESTINATION bin)
 
 #===============================================================================
-# Capability management (ptrace without root)
+# Capabilities target (REQUIRED for ptrace)
 #===============================================================================
 
 find_program(SETCAP setcap REQUIRED)
 find_program(SUDO sudo REQUIRED)
 
-# Post-build commands to set capabilities and setuid bit
-add_custom_command(TARGET dl_manager POST_BUILD
-    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager>
-    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager_daemon>
-    COMMAND ${SUDO} chmod u+s $<TARGET_FILE:dl_manager>
-    COMMAND ${SUDO} chmod u+s $<TARGET_FILE:dl_manager_daemon>
-    COMMAND echo "✅ CAP_SYS_PTRACE capability and setuid bit added successfully"
-    COMMENT "Adding CAP_SYS_PTRACE and setuid to allow ptrace without sudo (requires password)"
+# Target to set capabilities on installed files
+add_custom_target(cap-installed
+    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip ${CMAKE_INSTALL_PREFIX}/bin/dlpatch
+    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip ${CMAKE_INSTALL_PREFIX}/bin/dlpatchd
+    COMMENT "Setting CAP_SYS_PTRACE on installed binaries (REQUIRED for ptrace)"
+    VERBATIM
 )
 
-# Custom target for manual capability setting
+# Target to set capabilities on build files
+add_custom_target(cap-build
+    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dlpatch>
+    COMMAND ${SUDO} ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dlpatchd>
+    COMMENT "Setting CAP_SYS_PTRACE on build binaries (REQUIRED for ptrace)"
+    VERBATIM
+)
+
+# Alias for backward compatibility
 add_custom_target(cap
-    COMMAND sudo ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager>
-    COMMAND sudo ${SETCAP} cap_sys_ptrace=eip $<TARGET_FILE:dl_manager_daemon>
-    COMMENT "Granting CAP_SYS_PTRACE capability to executables (requires sudo password)"
+    COMMAND ${CMAKE_COMMAND} -E echo "Use 'make cap-installed' for installed files or 'make cap-build' for build files"
 )
 
-# Display capability information
+#===============================================================================
+# Interactive installation script (WITH automatic capabilities)
+#===============================================================================
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/install_script.sh.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/install_script.sh"
+    @ONLY
+)
+
+add_custom_target(install-interactive
+    COMMAND chmod +x ${CMAKE_CURRENT_BINARY_DIR}/install_script.sh
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/install_script.sh
+    COMMENT "Running interactive installation (will set CAP_SYS_PTRACE)"
+    USES_TERMINAL
+    VERBATIM
+)
+
+#===============================================================================
+# Wrapper script for easy build + install + capabilities
+#===============================================================================
+
+set(INSTALL_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/install.sh")
+file(WRITE ${INSTALL_SCRIPT}
+"#!/bin/bash
+# DLPatch build and install wrapper
+# Automatically sets CAP_SYS_PTRACE (required for ptrace)
+
+set -e
+
+echo \"========================================\"
+echo \"Building DLPatch with ${NCPUS} cores...\"
+echo \"Tests: ON\"
+echo \"========================================\"
+
+cd \"${CMAKE_BINARY_DIR}\" && make -j${NCPUS}
+
+echo \"========================================\"
+echo \"Installing DLPatch interactively...\"
+echo \"(Will ask for sudo to set CAP_SYS_PTRACE)\"
+echo \"========================================\"
+cd \"${CMAKE_BINARY_DIR}\" && make install-interactive
+
+echo \"========================================\"
+echo \"Done! Verifying capabilities:\"
+echo \"========================================\"
+getcap \$(which dlpatch) 2>/dev/null || echo \"⚠️  CAP_SYS_PTRACE not set!\"
+echo \"\"
+echo \"If capabilities missing, run:\"
+echo \"  cd ${CMAKE_BINARY_DIR} && sudo make cap-installed\"
+")
+
+execute_process(COMMAND chmod +x ${INSTALL_SCRIPT})
+add_custom_target(wrapper ALL COMMAND chmod +x ${INSTALL_SCRIPT})
+
+#===============================================================================
+# Info target
+#===============================================================================
+
+add_custom_target(info
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================"
+    COMMAND ${CMAKE_COMMAND} -E echo "DLPatch v${PROJECT_VERSION}"
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Parallel cores: ${NCPUS}"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Build type: ${CMAKE_BUILD_TYPE}"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Tests enabled: ON"
+    COMMAND ${CMAKE_COMMAND} -E echo "  libcap: FOUND (required)"
+    COMMAND ${CMAKE_COMMAND} -E echo ""
+    COMMAND ${CMAKE_COMMAND} -E echo "Commands:"
+    COMMAND ${CMAKE_COMMAND} -E echo "  ./install.sh                    # Build + install + capabilities"
+    COMMAND ${CMAKE_COMMAND} -E echo "  cd build && make -jN            # Build only"
+    COMMAND ${CMAKE_COMMAND} -E echo "  cd build && make test           # Run tests"
+    COMMAND ${CMAKE_COMMAND} -E echo "  cd build && make install-interactive # Install + capabilities"
+    COMMAND ${CMAKE_COMMAND} -E echo "  sudo make cap-installed         # Set capabilities (if missing)"
+    COMMAND ${CMAKE_COMMAND} -E echo "========================================"
+)
+
+#===============================================================================
+# Configure-time summary
+#===============================================================================
+
 message(STATUS "")
-message(STATUS "=== Ptrace Capability Note ===")
-message(STATUS "To trace processes not started by this program, you need CAP_SYS_PTRACE capability.")
-message(STATUS "The build system automatically adds this capability during build (requires sudo).")
-message(STATUS "If you need to reapply it later, use: make cap")
-message(STATUS "================================")
-
-#===============================================================================
-# Tests (optional)
-#===============================================================================
-
-option(BUILD_TESTS "Build tests" OFF)
-if(BUILD_TESTS)
-    add_subdirectory(tests)
-endif()
+message(STATUS "=== DLPatch ${PROJECT_VERSION} ===")
+message(STATUS "Tests enabled: ON")
+message(STATUS "Parallel build: ${NCPUS} cores")
+message(STATUS "libcap: FOUND - capabilities will be set automatically")
+message(STATUS "")
+message(STATUS "QUICK START (RECOMMENDED):")
+message(STATUS "  ./install.sh")
+message(STATUS "")
+message(STATUS "This will: build, install, and set CAP_SYS_PTRACE")
+message(STATUS "===================================")
