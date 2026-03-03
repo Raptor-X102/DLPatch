@@ -98,6 +98,244 @@ LoadResult DL_Manager::check_library_state(const std::string& lib_path,
     return LoadResult::USED_EXISTING;
 }
 
+//=============================================================================
+// Helper functions for library loading
+//=============================================================================
+
+/**
+ * @brief Check if library is already loaded (in tracker or in maps)
+ * @param lib_path Path to check
+ * @param normalized Normalized library path
+ * @param in_tracker [out] Whether library found in tracker
+ * @param in_maps [out] Whether library found in maps
+ * @param existing_base [out] Base address if found in maps
+ * @param tracked_lib [out] Reference to tracked library if found
+ * @return true if library found in tracker
+ */
+bool DL_Manager::check_library_presence(const std::string& lib_path,
+                                         const std::string& normalized,
+                                         bool& in_tracker,
+                                         bool& in_maps,
+                                         uintptr_t& existing_base,
+                                         TrackedLibrary*& tracked_lib) {
+    // Check if we have it in tracker
+    auto it = tracked_libraries_.find(normalized);
+    in_tracker = (it != tracked_libraries_.end());
+    if (in_tracker) {
+        tracked_lib = &it->second;
+    }
+    
+    // Check if library is already loaded in process memory
+    in_maps = is_library_in_maps(lib_path, existing_base);
+    
+    LOG_DBG("Library presence: in_tracker=%d, in_maps=%d", in_tracker, in_maps);
+    return in_tracker;
+}
+
+/**
+ * @brief Check if library file has changed since last load
+ * @param lib Tracked library object
+ * @param current_mtime Current file modification time
+ * @param current_size Current file size
+ * @param file_info_ok Whether file info was successfully obtained
+ * @return true if file has changed
+ */
+bool DL_Manager::has_library_file_changed(const TrackedLibrary& lib,
+                                           time_t current_mtime,
+                                           size_t current_size,
+                                           bool file_info_ok) {
+    if (!file_info_ok || lib.file_size == 0) {
+        return false; // Can't determine change
+    }
+    
+    if (lib.file_size != current_size) {
+        LOG_DBG("  size changed: %zu -> %zu", lib.file_size, current_size);
+        return true;
+    }
+    
+    if (lib.mtime != current_mtime) {
+        time_t diff = llabs(lib.mtime - current_mtime);
+        if (diff > MTIME_TOLERANCE) {
+            LOG_DBG("  mtime changed: %ld -> %ld", lib.mtime, current_mtime);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * @brief Load a fresh copy of a library and add to tracker
+ * @param tid Thread ID for injection
+ * @param lib_path Path to library
+ * @param normalized Normalized library path
+ * @param saved_regs Saved registers for injection
+ * @param current_mtime Current file modification time
+ * @param current_size Current file size
+ * @param file_info_ok Whether file info was obtained
+ * @param new_lib_base [out] Base address of loaded library
+ * @param new_handle [out] Handle of loaded library
+ * @return LoadResult::LOADED_NEW on success, LoadResult::FAILED on failure
+ */
+LoadResult DL_Manager::load_fresh_library(pid_t tid,
+                                           const std::string& lib_path,
+                                           const std::string& normalized,
+                                           struct user_regs_struct& saved_regs,
+                                           time_t current_mtime,
+                                           size_t current_size,
+                                           bool file_info_ok,
+                                           uintptr_t& new_lib_base,
+                                           uintptr_t& new_handle) {
+    LOG_INFO("Loading fresh copy of library: %s", lib_path.c_str());
+    
+    new_lib_base = load_new_library(tid, lib_path, new_handle, saved_regs);
+    if (new_lib_base == 0) {
+        return LoadResult::FAILED;
+    }
+    
+    // Add to tracker
+    TrackedLibrary& lib = tracked_libraries_[normalized];
+    lib = TrackedLibrary(normalized, new_handle, new_lib_base, "");
+    lib.mtime = file_info_ok ? current_mtime : 0;
+    lib.file_size = file_info_ok ? current_size : 0;
+    
+    LOG_DBG("  loaded fresh: base=0x%lx, handle=0x%lx", new_lib_base, new_handle);
+    return LoadResult::LOADED_NEW;
+}
+
+/**
+ * @brief Reload a library that has changed on disk
+ * @param tid Thread ID for injection
+ * @param lib_path Path to library
+ * @param lib Tracked library to reload
+ * @param saved_regs Saved registers for injection
+ * @param current_mtime Current file modification time
+ * @param current_size Current file size
+ * @param new_lib_base [out] Base address of reloaded library
+ * @param new_handle [out] Handle of reloaded library
+ * @return LoadResult::LOADED_NEW on success, LoadResult::FAILED on failure
+ */
+LoadResult DL_Manager::reload_changed_library(pid_t tid,
+                                               const std::string& lib_path,
+                                               TrackedLibrary& lib,
+                                               struct user_regs_struct& saved_regs,
+                                               time_t current_mtime,
+                                               size_t current_size,
+                                               uintptr_t& new_lib_base,
+                                               uintptr_t& new_handle) {
+    LOG_INFO("Library file changed, reloading: %s", lib_path.c_str());
+    
+    // Check if we can reload this library
+    if (lib.is_active && lib.is_original) {
+        LOG_ERR("Cannot reload active original library");
+        return LoadResult::FAILED;
+    }
+    
+    // Load new version first
+    uintptr_t temp_handle = 0, temp_base = 0;
+    temp_base = load_new_library(tid, lib_path, temp_handle, saved_regs);
+    if (temp_base == 0) {
+        return LoadResult::FAILED;
+    }
+    
+    // Unload old version
+    if (lib.handle != 0) {
+        LOG_DBG("  unloading old version with handle 0x%lx", lib.handle);
+        unload_library_by_handle(tid, lib.handle, saved_regs);
+    }
+    
+    // Update tracker
+    lib.handle = temp_handle;
+    lib.base_addr = temp_base;
+    lib.provided_functions.clear();
+    lib.mtime = current_mtime;
+    lib.file_size = current_size;
+    
+    new_lib_base = temp_base;
+    new_handle = temp_handle;
+    
+    LOG_INFO("Library reloaded successfully");
+    return LoadResult::LOADED_NEW;
+}
+
+/**
+ * @brief Handle library found in tracker
+ * @param tid Thread ID for injection
+ * @param lib_path Path to library
+ * @param lib Tracked library
+ * @param saved_regs Saved registers for injection
+ * @param current_mtime Current file modification time
+ * @param current_size Current file size
+ * @param file_info_ok Whether file info was obtained
+ * @param new_lib_base [out] Base address of library
+ * @param new_handle [out] Handle of library
+ * @return Appropriate LoadResult
+ */
+LoadResult DL_Manager::handle_tracked_library(pid_t tid,
+                                               const std::string& lib_path,
+                                               TrackedLibrary& lib,
+                                               struct user_regs_struct& saved_regs,
+                                               time_t current_mtime,
+                                               size_t current_size,
+                                               bool file_info_ok,
+                                               uintptr_t& new_lib_base,
+                                               uintptr_t& new_handle) {
+    // Check if file has changed
+    bool file_changed = has_library_file_changed(lib, current_mtime, current_size, file_info_ok);
+    
+    if (!file_changed) {
+        // File unchanged - use existing
+        LOG_INFO("Library already loaded and unchanged, using existing copy");
+        new_lib_base = lib.base_addr;
+        new_handle = lib.handle;
+        return LoadResult::USED_EXISTING;
+    } else {
+        // File changed, need to reload
+        return reload_changed_library(tid, lib_path, lib, saved_regs,
+                                      current_mtime, current_size,
+                                      new_lib_base, new_handle);
+    }
+}
+
+/**
+ * @brief Handle library found only in maps (loaded by process)
+ * @param tid Thread ID for injection
+ * @param lib_path Path to library
+ * @param normalized Normalized library path
+ * @param saved_regs Saved registers for injection
+ * @param current_mtime Current file modification time
+ * @param current_size Current file size
+ * @param file_info_ok Whether file info was obtained
+ * @param new_lib_base [out] Base address of library
+ * @param new_handle [out] Handle of library
+ * @return LoadResult::LOADED_NEW on success, LoadResult::FAILED on failure
+ */
+LoadResult DL_Manager::handle_maps_only_library(pid_t tid,
+                                                 const std::string& lib_path,
+                                                 const std::string& normalized,
+                                                 struct user_regs_struct& saved_regs,
+                                                 time_t current_mtime,
+                                                 size_t current_size,
+                                                 bool file_info_ok,
+                                                 uintptr_t& new_lib_base,
+                                                 uintptr_t& new_handle) {
+    LOG_INFO("Library loaded by process but not tracked, loading our copy: %s", lib_path.c_str());
+    
+    new_lib_base = load_new_library(tid, lib_path, new_handle, saved_regs);
+    if (new_lib_base == 0) {
+        return LoadResult::FAILED;
+    }
+    
+    // Add to tracker
+    TrackedLibrary& lib = tracked_libraries_[normalized];
+    lib = TrackedLibrary(normalized, new_handle, new_lib_base, "");
+    lib.mtime = file_info_ok ? current_mtime : 0;
+    lib.file_size = file_info_ok ? current_size : 0;
+    
+    LOG_INFO("Library loaded and tracked");
+    return LoadResult::LOADED_NEW;
+}
+
 /**
  * @brief Ensure a new library is loaded in the target process
  * @param tid Thread ID for injection
@@ -124,7 +362,6 @@ LoadResult DL_Manager::ensure_new_library_loaded(pid_t tid,
     }
     
     std::string normalized = normalize_path(new_lib_path);
-    
     LOG_DBG("ensure_new_library_loaded: %s (tid=%d)", new_lib_path.c_str(), tid);
     
     // Get current file info
@@ -132,103 +369,33 @@ LoadResult DL_Manager::ensure_new_library_loaded(pid_t tid,
     size_t current_size = 0;
     bool file_info_ok = get_file_info(new_lib_path, current_mtime, current_size);
     
-    // Check if library is already loaded in process memory
+    // Check library presence
+    bool in_tracker = false, in_maps = false;
     uintptr_t existing_base = 0;
-    bool in_maps = is_library_in_maps(new_lib_path, existing_base);
+    TrackedLibrary* tracked_lib = nullptr;
     
-    // Check if we have it in tracker
-    auto it = tracked_libraries_.find(normalized);
-    bool in_tracker = (it != tracked_libraries_.end());
+    check_library_presence(new_lib_path, normalized, in_tracker, in_maps, 
+                           existing_base, tracked_lib);
     
     // Case 1: Not in tracker and not in maps - load fresh
     if (!in_tracker && !in_maps) {
-        LOG_INFO("Library not loaded, loading fresh copy");
-        new_lib_base = load_new_library(tid, new_lib_path, new_handle, saved_regs);
-        if (new_lib_base == 0) return LoadResult::FAILED;
-        
-        TrackedLibrary& lib = tracked_libraries_[normalized];
-        lib = TrackedLibrary(normalized, new_handle, new_lib_base, "");
-        lib.mtime = file_info_ok ? current_mtime : 0;
-        lib.file_size = file_info_ok ? current_size : 0;
-        
-        LOG_DBG("  loaded fresh: base=0x%lx, handle=0x%lx", new_lib_base, new_handle);
-        return LoadResult::LOADED_NEW;
+        return load_fresh_library(tid, new_lib_path, normalized, saved_regs,
+                                  current_mtime, current_size, file_info_ok,
+                                  new_lib_base, new_handle);
     }
     
     // Case 2: In tracker - check if file changed and handle reload
-    if (in_tracker) {
-        TrackedLibrary& lib = it->second;
-        
-        // Check if file has changed
-        bool file_changed = false;
-        if (file_info_ok && lib.file_size != 0) {
-            if (lib.file_size != current_size) {
-                LOG_DBG("  size changed: %zu -> %zu", lib.file_size, current_size);
-                file_changed = true;
-            } else if (lib.mtime != current_mtime) {
-                time_t diff = llabs(lib.mtime - current_mtime);
-                if (diff > MTIME_TOLERANCE) {
-                    LOG_DBG("  mtime changed: %ld -> %ld", lib.mtime, current_mtime);
-                    file_changed = true;
-                }
-            }
-        }
-        
-        if (!file_changed) {
-            // File unchanged - use existing
-            LOG_INFO("Library already loaded and unchanged, using existing copy");
-            new_lib_base = lib.base_addr;
-            new_handle = lib.handle;
-            return LoadResult::USED_EXISTING;
-        } else {
-            // File changed, need to reload
-            LOG_INFO("Library file changed, reloading");
-            
-            if (lib.is_active && lib.is_original) {
-                LOG_ERR("Cannot reload active original library");
-                return LoadResult::FAILED;
-            }
-            
-            // Load new version first
-            uintptr_t temp_handle = 0, temp_base = 0;
-            temp_base = load_new_library(tid, new_lib_path, temp_handle, saved_regs);
-            if (temp_base == 0) return LoadResult::FAILED;
-            
-            // Unload old version
-            if (lib.handle != 0) {
-                LOG_DBG("  unloading old version with handle 0x%lx", lib.handle);
-                unload_library_by_handle(tid, lib.handle, saved_regs);
-            }
-            
-            // Update tracker
-            lib.handle = temp_handle;
-            lib.base_addr = temp_base;
-            lib.provided_functions.clear();
-            lib.mtime = current_mtime;
-            lib.file_size = current_size;
-            
-            new_lib_base = temp_base;
-            new_handle = temp_handle;
-            
-            LOG_INFO("Library reloaded successfully");
-            return LoadResult::LOADED_NEW;
-        }
+    if (in_tracker && tracked_lib != nullptr) {
+        return handle_tracked_library(tid, new_lib_path, *tracked_lib, saved_regs,
+                                      current_mtime, current_size, file_info_ok,
+                                      new_lib_base, new_handle);
     }
     
     // Case 3: In maps but not in tracker (loaded by process itself)
     if (in_maps && !in_tracker) {
-        LOG_INFO("Library loaded by process but not tracked, loading our copy");
-        
-        new_lib_base = load_new_library(tid, new_lib_path, new_handle, saved_regs);
-        if (new_lib_base == 0) return LoadResult::FAILED;
-        
-        TrackedLibrary& lib = tracked_libraries_[normalized];
-        lib = TrackedLibrary(normalized, new_handle, new_lib_base, "");
-        lib.mtime = file_info_ok ? current_mtime : 0;
-        lib.file_size = file_info_ok ? current_size : 0;
-        
-        LOG_INFO("Library loaded and tracked");
-        return LoadResult::LOADED_NEW;
+        return handle_maps_only_library(tid, new_lib_path, normalized, saved_regs,
+                                        current_mtime, current_size, file_info_ok,
+                                        new_lib_base, new_handle);
     }
     
     return LoadResult::FAILED;

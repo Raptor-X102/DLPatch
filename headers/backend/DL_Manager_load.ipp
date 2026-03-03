@@ -284,9 +284,12 @@ bool DL_Manager::unload_library(const std::string& lib_path) {
     if (!lib.patched_by.empty()) {
         LOG_ERR("Cannot unload library that is still referenced by %zu other libraries: %s", 
                 lib.patched_by.size(), lib_path.c_str());
+        
+#ifdef DEBUG
         for (const auto& ref : lib.patched_by) {
             LOG_DBG("  - referenced by: %s", ref.c_str());
         }
+#endif
         return false;
     }
     

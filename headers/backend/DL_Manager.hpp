@@ -139,6 +139,45 @@ public:
     //-------------------------------------------------------------------------
     // Rollback operations (DL_Manager_rollback.ipp)
     //-------------------------------------------------------------------------
+    bool validate_rollback_library(const std::string& lib_path,
+                                   std::string& normalized,
+                                   TrackedLibrary*& lib);
+    
+    bool prepare_for_rollback(const std::string& lib_path,
+                              std::vector<ThreadContext>& contexts,
+                              pid_t& worker_tid);
+    
+    bool restore_got_entry(pid_t worker_tid,
+                           TrackedLibrary& lib,
+                           const std::string& func_name,
+                           uintptr_t original_addr);
+    
+    bool restore_jmp_patch(pid_t worker_tid,
+                           TrackedLibrary& lib,
+                           const std::string& func_name,
+                           const std::vector<uint8_t>& original_bytes);
+    
+    int restore_all_got_entries(pid_t worker_tid,
+                                TrackedLibrary& lib,
+                                std::vector<std::string>& restored_functions);
+    
+    int restore_all_jmp_patches(pid_t worker_tid,
+                                TrackedLibrary& lib,
+                                std::vector<std::string>& restored_functions);
+    
+    void cleanup_after_rollback(TrackedLibrary& lib,
+                                const std::string& normalized,
+                                const std::vector<std::string>& restored_functions);
+    
+    void check_function_backup(const TrackedLibrary& lib,
+                               const std::string& func_name,
+                               bool& has_got,
+                               bool& has_jmp);
+    
+    bool restore_single_function(pid_t worker_tid,
+                                 TrackedLibrary& lib,
+                                 const std::string& func_name);
+
     bool rollback_library(const std::string &lib_path);                  // Rollback all patches for library
     bool rollback_function(const std::string &lib_path,
                            const std::string &func_name);                // Rollback single function
@@ -159,6 +198,7 @@ private:
     uintptr_t syscall_insn_;         // Address of syscall instruction
     bool tracker_initialized_;       // Whether tracker has been initialized
     std::map<std::string, std::string> function_providers_; // Maps function names to the library that currently provides them
+    std::vector<ThreadContext> thread_contexts_; // Stored thread contexts for restoration after replacement
 
     std::map<std::string, TrackedLibrary> tracked_libraries_; // Tracked libraries by path
     mutable std::map<uintptr_t, CachedLibraryData> library_cache_; // Cache by base address
@@ -284,6 +324,57 @@ private:
                                    uintptr_t &base,
                                    uintptr_t &handle,
                                    bool check_active_only = false);
+
+    bool check_library_presence(const std::string& lib_path,
+                                const std::string& normalized,
+                                bool& in_tracker,
+                                bool& in_maps,
+                                uintptr_t& existing_base,
+                                TrackedLibrary*& tracked_lib);
+    
+    bool has_library_file_changed(const TrackedLibrary& lib,
+                                   time_t current_mtime,
+                                   size_t current_size,
+                                   bool file_info_ok);
+    
+    LoadResult load_fresh_library(pid_t tid,
+                                   const std::string& lib_path,
+                                   const std::string& normalized,
+                                   struct user_regs_struct& saved_regs,
+                                   time_t current_mtime,
+                                   size_t current_size,
+                                   bool file_info_ok,
+                                   uintptr_t& new_lib_base,
+                                   uintptr_t& new_handle);
+    
+    LoadResult reload_changed_library(pid_t tid,
+                                       const std::string& lib_path,
+                                       TrackedLibrary& lib,
+                                       struct user_regs_struct& saved_regs,
+                                       time_t current_mtime,
+                                       size_t current_size,
+                                       uintptr_t& new_lib_base,
+                                       uintptr_t& new_handle);
+    
+    LoadResult handle_tracked_library(pid_t tid,
+                                       const std::string& lib_path,
+                                       TrackedLibrary& lib,
+                                       struct user_regs_struct& saved_regs,
+                                       time_t current_mtime,
+                                       size_t current_size,
+                                       bool file_info_ok,
+                                       uintptr_t& new_lib_base,
+                                       uintptr_t& new_handle);
+    
+    LoadResult handle_maps_only_library(pid_t tid,
+                                         const std::string& lib_path,
+                                         const std::string& normalized,
+                                         struct user_regs_struct& saved_regs,
+                                         time_t current_mtime,
+                                         size_t current_size,
+                                         bool file_info_ok,
+                                         uintptr_t& new_lib_base,
+                                         uintptr_t& new_handle);
     LoadResult ensure_new_library_loaded(pid_t tid,
                                          const std::string &new_lib_path,
                                          uintptr_t &new_lib_base,
@@ -301,6 +392,40 @@ private:
                              time_t target_mtime,
                              size_t target_size,
                              bool target_info_ok);
+    bool prepare_target_library(const std::string& target_lib_pattern,
+                                LibraryInfo& target_info,
+                                std::string& clean_target_path,
+                                std::string& normalized_target,
+                                time_t& target_mtime,
+                                size_t& target_size,
+                                bool& target_info_ok);
+    bool restore_original_library(const std::string& lib_path,
+                                          const std::string& target_function);
+    void restore_single_function(pid_t worker_tid, TrackedLibrary& lib,
+                                         const std::string& func_name,
+                                         const std::string& lib_normalized);
+    void restore_all_functions(pid_t worker_tid, TrackedLibrary& lib,
+                                       const std::string& lib_normalized);
+    void save_function_backup(TrackedLibrary& lib, const std::string& func_name);
+    bool check_new_library_state(const std::string& new_lib_path,
+                             uintptr_t& new_lib_base,
+                             uintptr_t& new_handle,
+                             bool& need_load,
+                             bool& need_patch);
+    bool restore_existing_library(const std::string& new_lib_path,
+                                          const std::string& normalized_new);
+    bool prepare_for_injection(const LibraryInfo& target_info,
+                                        const std::string& normalized_new,
+                                        bool need_load,
+                                        uintptr_t& new_lib_base,
+                                        uintptr_t& new_handle,
+                                        struct user_regs_struct& saved_regs,
+                                        pid_t& worker_tid);
+    void finish_replacement(const std::string& normalized_target,
+                                        const std::string& normalized_new,
+                                        pid_t worker_tid,
+                                        struct user_regs_struct& saved_regs,
+                                        bool patch_success);
 
     //-------------------------------------------------------------------------
     // Syscall helpers (DL_Manager_replace.ipp)
