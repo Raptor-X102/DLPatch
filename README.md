@@ -1,4 +1,4 @@
-# Live Patching (dlpatch)
+# DLPatch
 
 Live Patching is a runtime library replacement tool for Linux processes. It allows you to replace shared libraries or individual functions in a running process without restarting it. This is useful for hotfixes, A/B testing, or upgrading functionality on the fly.
 
